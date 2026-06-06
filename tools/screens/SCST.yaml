@@ -1,0 +1,5 @@
+magic: SCST
+is_sequential: 1
+resources:
+- id: 229474306
+  contents: !String TCSettings_GeneralMenu

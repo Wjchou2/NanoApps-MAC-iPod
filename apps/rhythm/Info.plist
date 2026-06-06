@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.rhythm</string>
+	<key>CFBundleName</key>		<string>Rhythm</string>
+	<key>CFBundleExecutable</key>	<string>rhythm</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>drum</string>
+	<key>HBIconColor</key>		<string>#e69934</string>
+</dict>
+</plist>

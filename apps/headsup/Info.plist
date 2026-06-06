@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.headsup</string>
+	<key>CFBundleName</key>		<string>Heads Up</string>
+	<key>CFBundleExecutable</key>	<string>headsup</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>lightbulb</string>
+	<key>HBIconColor</key>		<string>#a05434</string>
+</dict>
+</plist>

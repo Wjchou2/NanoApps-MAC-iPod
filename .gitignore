@@ -1,0 +1,10 @@
+.DS_Store
+*/build/
+apps/out/
+/lvgl/
+tools/dependencies/fontawesome/
+tools/dependencies/*/target/
+tools/__pycache__/
+*.bin
+*.elf
+*.o

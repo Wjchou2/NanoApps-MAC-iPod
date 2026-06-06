@@ -1,0 +1,6 @@
+1	Install the NanoApps apps
+0	Show it to a friend
+0	Try the OpenGL 3D demo
+0	Beat my 2048 high score
+1	Charge the nano
+0	Read a chapter in Books

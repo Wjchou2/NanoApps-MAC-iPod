@@ -1,0 +1,16 @@
+2026-12-25	1	Christmas
+2026-01-01	1	New Year's Day
+2026-02-14	1	Valentine's Day
+2026-10-31	1	Halloween
+2026-11-26	1	Thanksgiving (US)
+2026-07-04	1	US Independence Day
+2026-03-17	1	St. Patrick's Day
+2026-09-22	1	Autumn Equinox
+2026-12-21	1	Winter Solstice
+2026-06-21	1	Summer Solstice
+2026-03-20	1	Spring Equinox
+2026-04-22	1	Earth Day
+2026-05-25	0	Memorial Day 2026
+2026-09-07	0	Labor Day 2026
+1969-07-20	0	Apollo 11 Moon Landing
+2012-09-12	0	iPod nano 7 launched

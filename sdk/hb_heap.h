@@ -1,0 +1,36 @@
+/*
+ * hb_heap.h — the OS main heap (OS memory allocator).
+ *
+ * Homebrew shares the live OS heap. Two ways in:
+ *   - the heap allocator (0x0842d444) panics when the allocation fails.
+ *     A too-large request reboots the device. Never probe with it.
+ *   - The nothrow allocator (0x0842b440) underneath returns NULL
+ *     on failure. hb_os_alloc() wraps it, so you can request optimistically and
+ *     handle NULL.
+ *
+ * Use sparingly and free promptly — holding megabytes starves the OS (compositor,
+ * etc.). The free-size queries are pure reads (no allocation), safe to call any
+ * time, e.g. to size a buffer before grabbing it.
+ */
+#ifndef HB_HEAP_H
+#define HB_HEAP_H
+
+#include <stdint.h>
+
+/* Total free bytes in the OS heap right now (the free-size query). Pure read. */
+uint32_t hb_os_heap_free(void);
+
+/* Largest single CONTIGUOUS free block (the largest-free-block query) — the real
+ * ceiling for one allocation, which fragmentation can hold well below the total.
+ * Pure read. */
+uint32_t hb_os_heap_largest(void);
+
+/* Allocate `size` bytes from the OS heap. Returns NULL on failure (NOT a panic,
+ * unlike the heap allocator). The usable region is guaranteed to lie within physical
+ * SDRAM (0x08000000..0x0A000000). Free with hb_os_free(). */
+void *hb_os_alloc(uint32_t size);
+
+/* Free a block returned by hb_os_alloc (the matched free entry). */
+void hb_os_free(void *p);
+
+#endif /* HB_HEAP_H */

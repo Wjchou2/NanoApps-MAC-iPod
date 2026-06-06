@@ -1,0 +1,22 @@
+github.com	alice@example.com	G1tHub_demo_p4ss!	JBSWY3DPEHPK3PXP
+gmail.com	alice.walker	M@ilN0t1cesYou	KRSXG5BAEBQXAYI
+slack.com	alice.walker	W0rking4the_w33kend	NB2HI4DTHIXS65A
+fastmail.com	awalker	S3cur1ty_mailbox_77	OBQXG43XN5ZGS3JN
+ssh.work-server.io	alice	C0rrect-Horse-B@ttery!
+notion.so	alice.walker@example.com	N0ti0n_w0rkspace_2026	ME4DKMRSGE2C2OBT
+1password.com	alice.walker	Ma$ter_S3cret_v@ult
+internal-jenkins	deploy	robot_4cc0unt_xyz
+discord.com	alice#1234	D1sc0rd_quietPlace	GEZDGNBVGY3TQOJQ
+spotify.com	alice.walker	Spot1fy_d@ily_mix
+wifi.home	-	S0ftware_Defeats_All
+wifi.office	-	C0rporate-Guest-N0d3
+amazon.com	alice.walker@example.com	Sh1pIt!2026
+banking.example	awalker-99	Ne'er-The-S@me-Tw1ce	NFXG43LFNB2DEY3GMU
+twitter.com	@alicewrites	Birdsite_R1P_2023
+reddit.com	u/alicewrites	Th3_Reddit_K!ng
+youtube.com	alice.walker@example.com	Wat$h_TheV1d3os
+netflix.com	alice@example.com	Bingew0rthy_5
+disney+	awalker	M0use+Mickey_42
+nytimes.com	alice.walker@example.com	Cr0ssword_S0lver
+stripe.com	alice.walker	Pa1d_2026!	OQQGI5DCOJSXAYJAMFRG4
+linkedin.com	alice.walker	Bus1ness_N0t_Cas

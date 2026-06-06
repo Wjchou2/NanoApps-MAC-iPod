@@ -1,0 +1,26 @@
+Alice Walker	+1 (415) 555-0142	alice.walker@example.com	1200 Market St|San Francisco, CA 94102	College roommate; loves jazz and rock climbing
+Ben Carter	+1 (212) 555-0177	ben.carter@example.com	500 5th Ave|New York, NY 10110	Architecture firm in NYC; allergic to peanuts
+Carla Diaz	+34 612 555 098	carla@example.es	Calle Mayor 42|Madrid 28013	Met at Barcelona conference; speaks Spanish, English, Catalan
+Daniel Kim	+82 10-1234-5678	daniel.kim@example.kr	Gangnam-gu|Seoul 06234	Old work friend; loves ramen
+Emily Stone	+44 20 7946 0123	emily.stone@example.co.uk	221B Baker St|London NW1 6XE	UX designer; partial to Earl Grey
+Felipe Rocha	+55 21 91234-5678	felipe@example.br	Rua Visconde de Piraja|Rio de Janeiro 22410	Photographer; visiting in October
+Grace Liu	+1 (650) 555-0211	grace.liu@example.com	2400 University Ave|Palo Alto, CA 94301	Mentor from grad school; expecting twin
+Henry O'Connor	+353 1 555 0143	henry.oc@example.ie	14 Grafton St|Dublin 2	Brewery owner; sends Christmas card every year
+Iris Yamamoto	+81 3-5555-0188	iris.y@example.jp	2-1-1 Roppongi|Minato, Tokyo	Translator; reads classical Japanese
+Jacob Mendez	+1 (305) 555-0166	jake.mendez@example.com	1500 Ocean Dr|Miami Beach, FL 33139	Surf instructor; helped me through hurricane season
+Kira Patel	+91 22 5555 0177	kira.p@example.in	Bandra West|Mumbai 400050	Software engineer; vegetarian
+Luca Romano	+39 06 5555 0123	luca.r@example.it	Via del Corso 45|Rome 00186	Sommelier; recommended that Tuscan vineyard
+Mei Tanaka	+81 90-1234-5678	mei.t@example.jp	1-2-3 Shibuya|Tokyo 150-0002	Childhood friend; visits every December
+Noah Foster	+1 (303) 555-0144	noah.foster@example.com	1700 Larimer St|Denver, CO 80202	Brother-in-law; loves hiking the Rockies
+Olivia Brown	+44 131 555 0099	olivia@example.co.uk	5 Princes St|Edinburgh EH2 2AN	Pediatrician; vegetarian, no shellfish
+Priya Singh	+1 (510) 555-0156	priya.s@example.com	2100 Telegraph Ave|Oakland, CA 94612	PhD advisor; brutal feedback but fair
+Quentin Beaulieu	+33 1 55 55 01 23	quentin@example.fr	22 Rue du Faubourg|Paris 75011	Painter; opening a gallery next spring
+Rosa Ferreira	+351 21 555 0188	rosa.f@example.pt	Avenida da Liberdade|Lisbon 1250-145	Travel writer; just back from Antarctica
+Samir Haddad	+961 1 555 0143	samir.h@example.lb	Hamra St|Beirut 1103	Cousin; runs the family restaurant
+Tara Nguyen	+1 (713) 555-0177	tara.n@example.com	5800 Westheimer|Houston, TX 77057	Doctor; on call most weekends
+Uri Kovac	+386 1 555 0144	uri.k@example.si	Presernov trg|Ljubljana 1000	Skiing buddy; we met at a hostel
+Violet Park	+1 (206) 555-0199	violet.p@example.com	1620 Pike Pl|Seattle, WA 98101	Coffee roaster; sends beans every quarter
+William Hayes	+61 2 5555 0123	will.hayes@example.com.au	Circular Quay|Sydney NSW 2000	Brother; finance, expat in Sydney since 2018
+Xiao Chen	+86 21 5555 0188	xiao.c@example.cn	The Bund|Shanghai 200002	Old roommate; jewelry designer
+Yusuf Khan	+92 21 5555 0177	yusuf.k@example.pk	Clifton|Karachi 75600	Met traveling; expert on Mughal architecture
+Zoe Martinez	+1 (619) 555-0150	zoe.m@example.com	1900 Garnet Ave|San Diego, CA 92109	Cousin; marine biologist

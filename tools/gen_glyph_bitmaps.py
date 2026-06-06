@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""gen_glyph_bitmaps.py — render the card-game glyphs (chess pieces + card suits)
+to A8 lv_image_dsc_t C data the apps blit with recolor, instead of letters.
+
+Chess pieces come from Font Awesome Free (Solid); the four card suits are drawn
+procedurally (FA Free has heart + diamond but not club/spade, so we draw all four
+for a consistent weight). Output: sdk/generated/hb_glyphs.{c,h}, one A8 image per
+glyph at GLYPH_PX square (alpha only; the app picks the color at draw time).
+
+Run from the repo root:  python3 tools/gen_glyph_bitmaps.py
+"""
+import json
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = Path(__file__).resolve().parent.parent
+FA_DIR = ROOT / "tools" / "dependencies" / "fontawesome"
+FA_OTF = str(FA_DIR / "otfs" / "Font Awesome 7 Free-Solid-900.otf")
+FA_META = json.load(open(FA_DIR / "metadata" / "icons.json"))
+OUT_C = ROOT / "sdk" / "generated" / "hb_glyphs.c"
+OUT_H = ROOT / "sdk" / "generated" / "hb_glyphs.h"
+
+GLYPH_PX = 48          # square A8 canvas per glyph
+SS = 4                 # supersample factor for crisp anti-aliasing
+
+CHESS = {              # name -> FA Free Solid glyph
+    "king": "chess-king", "queen": "chess-queen", "rook": "chess-rook",
+    "bishop": "chess-bishop", "knight": "chess-knight", "pawn": "chess-pawn",
+}
+SUITS = ("club", "diamond", "heart", "spade")
+
+# 24 distinct FA icons for Mahjong's abstract pair-match tiles (the game just needs
+# them to be visually distinct), plus a couple for Minesweeper. Each is rendered by
+# its own FA name (hb_glyph_<name>).
+FA_ICONS = (
+    "star", "moon", "sun", "bolt", "fire", "leaf", "droplet", "snowflake", "crown",
+    "gem", "bell", "anchor", "feather", "cube", "key", "bug", "ghost", "paw", "fish",
+    "frog", "dragon", "dove", "cat", "tree",          # 24 -> Mahjong
+    "bomb", "flag",                                    # Minesweeper
+)
+
+
+def fa_glyph(fa_name, px):
+    """A square `px` alpha image of a Font Awesome glyph, centred with a margin."""
+    cp = chr(int(FA_META[fa_name]["unicode"], 16))
+    inner = int(px * 0.86)
+    font = ImageFont.truetype(FA_OTF, inner)
+    tmp = Image.new("L", (px * 3, px * 3), 0)
+    d = ImageDraw.Draw(tmp)
+    bb = d.textbbox((0, 0), cp, font=font)
+    gw, gh = bb[2] - bb[0], bb[3] - bb[1]
+    glyph = Image.new("L", (max(1, gw), max(1, gh)), 0)
+    ImageDraw.Draw(glyph).text((-bb[0], -bb[1]), cp, font=font, fill=255)
+    out = Image.new("L", (px, px), 0)
+    out.paste(glyph, ((px - gw) // 2, (px - gh) // 2))
+    return out
+
+
+def _poly(d, pts, n):
+    d.polygon([(x * n, y * n) for x, y in pts], fill=255)
+
+
+def _disc(d, cx, cy, r, n):
+    d.ellipse([(cx - r) * n, (cy - r) * n, (cx + r) * n, (cy + r) * n], fill=255)
+
+
+def suit_glyph(name, px):
+    """A square `px` alpha image of a card suit, drawn supersampled then downscaled."""
+    dim = px * SS                              # full supersampled canvas dimension
+    big = Image.new("L", (dim, dim), 0)
+    d = ImageDraw.Draw(big)
+    if name == "diamond":
+        _poly(d, [(0.5, 0.05), (0.88, 0.5), (0.5, 0.95), (0.12, 0.5)], dim)
+    elif name == "heart":
+        _disc(d, 0.30, 0.34, 0.21, dim)
+        _disc(d, 0.70, 0.34, 0.21, dim)
+        _poly(d, [(0.085, 0.40), (0.915, 0.40), (0.5, 0.93)], dim)
+    elif name == "spade":
+        # heart flipped vertically (point up) + a stem
+        _disc(d, 0.30, 0.56, 0.21, dim)
+        _disc(d, 0.70, 0.56, 0.21, dim)
+        _poly(d, [(0.085, 0.50), (0.915, 0.50), (0.5, 0.06)], dim)
+        _poly(d, [(0.40, 0.62), (0.60, 0.62), (0.70, 0.95), (0.30, 0.95)], dim)
+    elif name == "club":
+        _disc(d, 0.50, 0.27, 0.20, dim)
+        _disc(d, 0.28, 0.55, 0.20, dim)
+        _disc(d, 0.72, 0.55, 0.20, dim)
+        _poly(d, [(0.42, 0.55), (0.58, 0.55), (0.70, 0.95), (0.30, 0.95)], dim)
+    return big.resize((px, px), Image.LANCZOS)
+
+
+def emit(name, img):
+    data = img.tobytes()                       # row-major, 1 byte/px (L)
+    w, h = img.size
+    rows = []
+    for y in range(h):
+        row = data[y * w:(y + 1) * w]
+        rows.append("    " + ",".join(str(b) for b in row) + ",")
+    body = "\n".join(rows)
+    return (
+        f"static const uint8_t glyph_{name}_map[{w * h}] = {{\n{body}\n}};\n"
+        f"const lv_image_dsc_t hb_glyph_{name} = {{\n"
+        f"    .header.magic = LV_IMAGE_HEADER_MAGIC,\n"
+        f"    .header.cf = LV_COLOR_FORMAT_A8,\n"
+        f"    .header.w = {w}, .header.h = {h}, .header.stride = {w},\n"
+        f"    .data_size = {w * h}, .data = glyph_{name}_map,\n"
+        f"}};\n")
+
+
+def main():
+    glyphs = []
+    for name, fa in CHESS.items():
+        glyphs.append((name, fa_glyph(fa, GLYPH_PX)))
+    for name in SUITS:
+        glyphs.append((name, suit_glyph(name, GLYPH_PX)))
+    for name in FA_ICONS:
+        glyphs.append((name, fa_glyph(name, GLYPH_PX)))
+
+    OUT_C.parent.mkdir(parents=True, exist_ok=True)
+    names = [n for n, _ in glyphs]
+    OUT_H.write_text(
+        "/* Generated by tools/gen_glyph_bitmaps.py — do not edit. */\n"
+        "#ifndef HB_GLYPHS_H\n#define HB_GLYPHS_H\n#include \"lvgl.h\"\n\n"
+        + "".join(f"extern const lv_image_dsc_t hb_glyph_{n};\n" for n in names)
+        + "\n#endif\n")
+    OUT_C.write_text(
+        "/* Generated by tools/gen_glyph_bitmaps.py — do not edit. */\n"
+        "#include \"hb_glyphs.h\"\n\n"
+        + "\n".join(emit(n, im) for n, im in glyphs))
+    print(f"wrote {OUT_C} + {OUT_H} ({len(glyphs)} glyphs at {GLYPH_PX}px A8)")
+
+
+if __name__ == "__main__":
+    main()

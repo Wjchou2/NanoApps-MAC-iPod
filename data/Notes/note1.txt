@@ -1,0 +1,3 @@
+Welcome to NanoApps
+Tap any note to edit it. Typing autosaves on every keystroke, so there is no save button.
+Swipe a row left to delete it.

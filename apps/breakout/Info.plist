@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.breakout</string>
+	<key>CFBundleName</key>		<string>Breakout</string>
+	<key>CFBundleExecutable</key>	<string>breakout</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>cubes-stacked</string>
+	<key>HBIconColor</key>		<string>#e65d53</string>
+</dict>
+</plist>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.screenshot</string>
+	<key>CFBundleName</key>		<string>Screenshot</string>
+	<key>CFBundleExecutable</key>	<string>screenshot</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>camera</string>
+	<key>HBIconColor</key>		<string>#2980b9</string>
+</dict>
+</plist>

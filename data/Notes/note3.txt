@@ -1,0 +1,5 @@
+App ideas
+- Tiny step-sequencer synth
+- Live transit board
+- Pocket star chart
+- Tip calculator

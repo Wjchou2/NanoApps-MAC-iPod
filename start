@@ -1,0 +1,1478 @@
+#!/usr/bin/env python3
+"""start — the entry point for NanoApps: build, install, and debug homebrew
+apps on the iPod nano 7g.
+
+Run `./start` from the repo root. With no arguments it opens an interactive
+menu; otherwise use a subcommand (below). On a fresh checkout it sets itself up
+for you: it asks where the iPod is attached and remembers the answer, then
+auto-installs anything missing (ARM toolchain, Python + Pillow, the pinned LVGL
+checkout, Font Awesome, sg3-utils) before the first build — so the usual first
+run is just `./start install`.
+
+The iPod is driven over a custom SCSI channel, which needs a Linux computer:
+
+  * the iPod is attached to THIS computer (Linux, such as a Raspberry Pi)
+    -> commands run sg_raw locally; or
+  * you work on a Mac and the iPod hangs off a remote Linux computer (such as a
+    Raspberry Pi) -> commands run sg_raw over SSH.
+
+Which one is configured per user (no hardcoded host): a directly-attached iPod
+is auto-detected, otherwise the first device command prompts and saves the
+choice (re-run `start setup` to change it). Override per run with --local,
+--remote user@host, or $REMOTE. Every device op — build, disk install, SCSI
+upload + exec, peek/trace/pull — goes through one transport, so the same command
+works either way; the iPod's Linux computer needs only sg3-utils + a mount
+point (no repo checkout there).
+
+Commands (all also runnable interactively via `start` with no args -> wizard):
+
+  start deps                  discover + install every dependency (works on
+                             apt/dnf/pacman/zypper + brew) AND clone stock upstream
+                             LVGL at the pinned commit, so a fresh machine is ready
+                             to build + install (--check = report only, don't install).
+                             Build/install also auto-install anything missing first.
+  start setup                 (re)configure where the iPod is attached
+  start new <name>            scaffold a new app by cloning the closest template of
+                             a kind (--kind lvgl|gl|raw) under a new name + identity
+  start install [targets...]  build resident + apps, pack, write to disk, exec,
+                             eject. With no targets installs everything; an APP
+                             target installs just it (+resident); a HARNESS/system
+                             target is built + exec'd once over SCSI.
+                             (--demo-data also copies data/ -> /Apps/Data,
+                              skip-existing; --demo-data-force overwrites on-device;
+                              --resident-only re-execs just the resident, no app compile)
+  start run <target>          build one target + run it once over SCSI
+  start pull [media|bench]    mount the iPod's FAT disk and pull files: `media`
+                             grabs screenshots + recordings, converts them
+                             (Pillow + recsplit), encodes the recordings to video
+                             (GIF + H.264 MP4 by default; --prores adds ProRes 4444,
+                             --lossless adds qtrle; --fps N, --force), and clears them
+                             from the device. ffmpeg is installed on first use if
+                             missing (decline = keep the frames, skip encoding).
+                             `bench` grabs the benchmark CSVs into bench_results/
+  start eject                 leave Connected mode so the iPod mounts its FS / home
+  start remount               put the iPod in Connected mode + mount its disk read-write
+  start fsck                  repair the iPod's FAT filesystem (fixes a read-only
+                             disk left by a panic / unclean eject)
+  start peek <addr> [n]       dump n bytes of iPod DRAM (default 0x200) as hex
+  start trace [n]             print the last n resident trace entries
+  start build [targets...]    build only (no device)
+  start wizard                interactive menu
+
+Targets resolve across apps/ system/ harnesses/. `start` with no args == wizard.
+"""
+import argparse, os, platform, re, shutil, struct, subprocess, sys, tempfile, time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent   # the repo root (this script lives there)
+TRACE_RING = 0x09120000
+TRACE_MAGIC = 0x48425452  # 'RTBH'
+
+# Per-user transport config (NO hardcoded host). First device op prompts for
+# the setup and persists it here; `start setup` re-runs the prompt.
+CONFIG_FILE = (Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+               / "nanoapps" / "config")
+
+
+def load_config():
+    cfg = {}
+    if CONFIG_FILE.is_file():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text("".join(f"{k}={v}\n" for k, v in cfg.items()))
+
+
+def _have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def _run(cmd):
+    print("    $ " + (cmd if isinstance(cmd, str) else " ".join(cmd)))
+    return subprocess.run(["bash", "-c", cmd] if isinstance(cmd, str) else cmd, check=False)
+
+
+# The upstream LVGL commit we branched our config from. We run STOCK upstream (no
+# fork patch); the n7g build is configured entirely through sdk/lv_conf.h, so a
+# fresh machine just needs this exact tree cloned next to the repo.
+LVGL_REPO = "https://github.com/lvgl/lvgl.git"
+LVGL_PIN = "829c7a22191e5dc0aceba71c54c09f42c08e3ac5"
+
+# Font Awesome Free (desktop) supplies the icon glyphs build_apps.py renders the
+# home-screen icons from. It's large + gitignored, so fetch it on demand.
+FA_VERSION = "7.2.0"
+FA_URL = (f"https://github.com/FortAwesome/Font-Awesome/releases/download/"
+          f"{FA_VERSION}/fontawesome-free-{FA_VERSION}-desktop.zip")
+FA_DIR = ROOT / "tools" / "dependencies" / "fontawesome"
+
+
+def setup_fontawesome(check_only=False):
+    """Ensure tools/dependencies/fontawesome/ has the OTF + metadata the icon
+    builder needs. Download + extract the Font Awesome Free desktop zip if not."""
+    otf = FA_DIR / "otfs" / f"Font Awesome {FA_VERSION[0]} Free-Solid-900.otf"
+    meta = FA_DIR / "metadata" / "icons.json"
+    if otf.is_file() and meta.is_file():
+        print(f"  fontawesome/           ok (Font Awesome {FA_VERSION} Free)")
+        return True
+    print("  fontawesome/           MISSING")
+    if check_only:
+        return False
+    import urllib.request, zipfile, tempfile, shutil as _sh
+    print(f"    -> downloading Font Awesome {FA_VERSION} Free (desktop)")
+    FA_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        zp = os.path.join(td, "fa.zip")
+        try:
+            urllib.request.urlretrieve(FA_URL, zp)
+            with zipfile.ZipFile(zp) as z:
+                z.extractall(td)
+        except Exception as e:
+            print(f"    !! download failed: {e}\n       grab {FA_URL} manually -> {FA_DIR}")
+            return False
+        inner = os.path.join(td, f"fontawesome-free-{FA_VERSION}-desktop")
+        for sub in ("otfs", "metadata", "svgs", "LICENSE.txt"):
+            src = os.path.join(inner, sub)
+            if not os.path.exists(src):
+                continue
+            dst = FA_DIR / sub
+            if os.path.isdir(src):
+                _sh.rmtree(dst, ignore_errors=True); _sh.copytree(src, dst)
+            else:
+                _sh.copy2(src, dst)
+    return otf.is_file() and meta.is_file()
+
+
+def _is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _confirm(prompt, default=True):
+    """Ask a single yes/no question. Non-interactive (no TTY) proceeds with the
+    default so scripted/CI use isn't blocked."""
+    if not sys.stdin.isatty():
+        return default
+    suffix = "[Y/n]" if default else "[y/N]"
+    ans = input(f"{prompt} {suffix} ").strip().lower()
+    return default if not ans else ans in ("y", "yes")
+
+
+def _sudo():
+    """Privilege prefix for system package installs: '' when already root (prefer
+    no sudo), 'sudo ' when we must elevate, or None when we can't."""
+    if _is_root():
+        return ""
+    return "sudo " if _have("sudo") else None
+
+
+def _linux_pkg_mgr():
+    """First available distro package manager, or None (e.g. on macOS)."""
+    for mgr in ("apt-get", "dnf", "pacman", "zypper"):
+        if _have(mgr):
+            return mgr
+    return None
+
+
+def _linux_pkg_cmd(pkgs):
+    """Shell command to install `pkgs` ({manager: package} or str) with the local
+    package manager, or None if there's no manager / package / way to elevate.
+    Uses sudo only when not already root."""
+    mgr = _linux_pkg_mgr()
+    if not mgr:
+        return None
+    pkg = pkgs.get(mgr) if isinstance(pkgs, dict) else pkgs
+    if not pkg:
+        return None
+    sudo = _sudo()
+    if sudo is None:
+        return None
+    return {
+        "apt-get": f"{sudo}apt-get install -y {pkg}",
+        "dnf":     f"{sudo}dnf install -y {pkg}",
+        "pacman":  f"{sudo}pacman -S --noconfirm {pkg}",
+        "zypper":  f"{sudo}zypper install -y {pkg}",
+    }[mgr]
+
+
+def _linux_install(pkgs):
+    cmd = _linux_pkg_cmd(pkgs)
+    if not cmd:
+        print("    -> no package manager / known package / sudo; install manually")
+        return False
+    return _run(cmd).returncode == 0
+
+
+def _pip_install(pkg):
+    """pip install into the user site (no sudo). In an externally-managed
+    environment (PEP 668) pip refuses --user, so auto-retry with
+    --break-system-packages — but only when pip actually asks for it, so we never
+    pass that flag to an older pip (<23.0.1) that wouldn't recognise it."""
+    base = [sys.executable, "-m", "pip", "install", "--user", pkg]
+    print("    $ " + " ".join(base))
+    try:
+        r = subprocess.run(base, capture_output=True, text=True)
+    except FileNotFoundError:
+        print("    -> python3 -m pip is unavailable")
+        return False
+    sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        return True
+    out = r.stdout + r.stderr
+    if "externally-managed-environment" in out or "break-system-packages" in out:
+        print("    -> environment is externally managed (PEP 668); "
+              "retrying with --break-system-packages")
+        return subprocess.run(base + ["--break-system-packages"]).returncode == 0
+    if "No module named pip" in out or "No module named \"pip\"" in out:
+        print("    -> pip is not installed for this Python (try: install the distro "
+              "python3-pip package, or the package directly)")
+    return False
+
+
+def _py_install(pip_pkg, distro_pkgs=None):
+    """Install a Python module, preferring the distro package on Linux (needs no
+    pip and sidesteps PEP 668 entirely — important on minimal Ubuntu/Debian images
+    that ship python3 without python3-pip), and falling back to pip otherwise."""
+    if platform.system() != "Darwin" and distro_pkgs and _linux_pkg_mgr():
+        if _linux_install(distro_pkgs):
+            return True
+        print("    -> distro package unavailable; falling back to pip")
+    return _pip_install(pip_pkg)
+
+
+def setup_lvgl(check_only=False):
+    """Ensure lvgl/ exists at the pinned upstream commit (a fresh checkout has no
+    lvgl/ — it's a sibling repo, not tracked here). Clone + pin if missing."""
+    lvgl = ROOT / "lvgl"
+    head = lvgl / ".git"
+    if head.exists():
+        cur = subprocess.run(["git", "-C", str(lvgl), "rev-parse", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+        if cur.startswith(LVGL_PIN[:12]):
+            print(f"  lvgl/                  ok (pinned {LVGL_PIN[:12]})")
+            return True
+        print(f"  lvgl/                  present but at {cur[:12]}, not the pin {LVGL_PIN[:12]}")
+        if check_only:
+            return False
+        _run(["git", "-C", str(lvgl), "fetch", "--depth", "1", "origin", LVGL_PIN])
+        _run(["git", "-C", str(lvgl), "checkout", "-f", LVGL_PIN])
+        return True
+    print("  lvgl/                  MISSING")
+    if check_only:
+        return False
+    print("    -> fetching stock upstream LVGL at the pin (shallow)")
+    # Fetch ONLY the pinned commit at depth 1 (a few MB) instead of cloning the
+    # full history (~146k objects). GitHub allows fetching an arbitrary SHA.
+    _run(["git", "init", "-q", str(lvgl)])
+    _run(["git", "-C", str(lvgl), "remote", "add", "origin", LVGL_REPO])
+    _run(["git", "-C", str(lvgl), "fetch", "--depth", "1", "origin", LVGL_PIN])
+    _run(["git", "-C", str(lvgl), "checkout", "-f", LVGL_PIN])
+    return lvgl.joinpath(".git").exists()
+
+
+# The icon builder pulls glyphs through ipodhax (vendored Python; its only
+# third-party need is Pillow) and compiles the screen DB with silverutil (a Rust
+# cargo project, pure-Rust deps), so the full build set is: ARM gcc + make + git +
+# Pillow + the Rust toolchain (cargo), plus the LVGL + Font Awesome checkouts.
+RUST_PKGS = {"apt-get": "cargo", "dnf": "cargo", "pacman": "rust", "zypper": "cargo"}
+
+# Tools the iPod's Linux computer needs (SCSI transport + FAT mount/repair). Package
+# names vary by distro, so each maps to a {manager: package} dict (or a plain str).
+_SG3 = {"apt-get": "sg3-utils", "dnf": "sg3_utils", "pacman": "sg3_utils", "zypper": "sg3_utils"}
+_DOSFS = {"apt-get": "dosfstools", "dnf": "dosfstools", "pacman": "dosfstools", "zypper": "dosfstools"}
+DEVTOOLS = (("sg_raw", _SG3), ("sg_start", _SG3), ("rsync", "rsync"),
+            ("eject", "util-linux"), ("fsck.vfat", _DOSFS), ("mount", "util-linux"))
+
+
+def ensure_build_deps():
+    """Auto-detect the host prerequisites needed to BUILD (ARM gcc, make, git, a
+    host C compiler, cargo, Pillow) plus the stock LVGL + Font Awesome checkouts.
+    A fast no-op when everything's present. Otherwise it lists what's missing and
+    asks ONCE before installing (sudo only when needed; pip stays in the user site
+    with a PEP 668 fallback). The full host+device setup is `start deps`."""
+    import importlib.util
+    darwin = platform.system() == "Darwin"
+    have_pil = importlib.util.find_spec("PIL") is not None
+    have_elf = importlib.util.find_spec("elftools") is not None   # mkrelocapp.py packs .hbapp via pyelftools
+    have_fa = (FA_DIR / "metadata" / "icons.json").is_file()
+    have_cc = _have("cc") or _have("gcc") or _have("clang")
+    have_lvgl = (ROOT / "lvgl" / ".git").exists()
+    if (_have("arm-none-eabi-gcc") and _have("make") and _have("git")
+            and _have("cargo") and have_cc and have_pil and have_elf and have_fa and have_lvgl):
+        return
+
+    # Build the plan: each entry is (label, command-or-None, runner). A runner of
+    # None means we can't auto-install it (print a manual hint instead).
+    plan = []   # (label, runner|None)
+
+    def pkg(tool, present, brew, linux):
+        if present:
+            return
+        if darwin and brew:
+            cmd = f"brew install {brew}"
+            plan.append((tool, cmd, lambda: _run(["brew", "install", brew]).returncode == 0))
+        elif not darwin:
+            cmd = _linux_pkg_cmd(linux)
+            plan.append((tool, cmd, (lambda c=linux: _linux_install(c)) if cmd else None))
+        else:
+            plan.append((tool, None, None))
+
+    pkg("arm-none-eabi-gcc (ARM toolchain)", _have("arm-none-eabi-gcc"), "arm-none-eabi-gcc",
+        {"apt-get": "gcc-arm-none-eabi", "dnf": "arm-none-eabi-gcc-cs",
+         "pacman": "arm-none-eabi-gcc", "zypper": "cross-arm-none-eabi-gcc"})
+    pkg("make", _have("make"), "make", "make")
+    pkg("git", _have("git"), "git", "git")
+    if not have_cc:                            # host linker for Rust/cargo (silverutil)
+        if darwin:
+            plan.append(("cc (host linker)", None, None))   # Xcode CLT, manual
+        else:
+            cc = {"apt-get": "gcc", "dnf": "gcc", "pacman": "gcc", "zypper": "gcc"}
+            cmd = _linux_pkg_cmd(cc)
+            plan.append(("cc (host linker)", cmd, (lambda: _linux_install(cc)) if cmd else None))
+    pkg("cargo (Rust toolchain)", _have("cargo"), "rust", RUST_PKGS)
+    if not have_pil:
+        pil_distro = {"apt-get": "python3-pil", "dnf": "python3-pillow",
+                      "pacman": "python-pillow", "zypper": "python3-Pillow"}
+        plan.append(("Python Pillow", _linux_pkg_cmd(pil_distro) or f"{sys.executable} -m pip install --user pillow",
+                     lambda: _py_install("pillow", pil_distro)))
+    if not have_elf:
+        elf_distro = {"apt-get": "python3-pyelftools", "dnf": "python3-pyelftools",
+                      "pacman": "python-pyelftools", "zypper": "python3-pyelftools"}
+        plan.append(("Python pyelftools", _linux_pkg_cmd(elf_distro) or f"{sys.executable} -m pip install --user pyelftools",
+                     lambda: _py_install("pyelftools", elf_distro)))
+    if not have_lvgl:
+        plan.append(("LVGL (pinned checkout)", "git clone (stock upstream @ pin)", lambda: setup_lvgl()))
+    if not have_fa:
+        plan.append((f"Font Awesome {FA_VERSION}", "download (desktop zip)", lambda: setup_fontawesome()))
+
+    print("\nstart: these build dependencies are missing:")
+    for label, cmd, runner in plan:
+        note = "" if runner else "   (install manually)"
+        print(f"  - {label}{note}" + (f"\n        {cmd}" if cmd and runner else ""))
+    manual = [l for l, _, r in plan if r is None]
+    if all(r is None for _, _, r in plan):
+        sys.exit("none of the above can be auto-installed here — install them, then re-run.")
+    if not _confirm("\nInstall the above now?"):
+        sys.exit("aborted — install the dependencies above, then re-run.")
+
+    for label, cmd, runner in plan:
+        if runner is None:
+            hint = " (run: xcode-select --install)" if "host linker" in label and darwin else ""
+            print(f"  ! {label}: install manually{hint}")
+            continue
+        print(f"==> {label}")
+        runner()
+
+
+def ensure_device_deps(tr):
+    """Best-effort auto-install of the iPod-machine's SCSI/FAT tools before a deploy
+    needs them. One batched, sbin-aware presence probe (non-login SSH PATH omits
+    /sbin), so it's a single round-trip and silent + fast when all present. Skips
+    quietly if the iPod's computer isn't reachable."""
+    probe = "; ".join(f'PATH=/usr/sbin:/sbin:$PATH command -v {t} >/dev/null 2>&1 || echo {t}'
+                      for t, _ in DEVTOOLS)
+    if tr.mode == "ssh":
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", tr.pi, probe],
+                           capture_output=True, text=True)
+        if r.returncode != 0 and not r.stdout.strip():   # unreachable — leave it
+            return
+        missing = set(r.stdout.split())
+    else:
+        missing = set(subprocess.run(["bash", "-c", probe],
+                                     capture_output=True, text=True).stdout.split())
+    if not missing:
+        return
+    where = "the iPod's computer" if tr.mode == "ssh" else "this computer"
+    print(f"\nstart: {where} is missing these tools: {', '.join(sorted(missing))}")
+    if not _confirm(f"Install them on {where} now?"):
+        print("skipped — install them, then re-run.")
+        return
+    for tool, pkgs in DEVTOOLS:
+        if tool in missing:
+            _remote_install(tr, pkgs) if tr.mode == "ssh" else _linux_install(pkgs)
+
+
+# ---------------------------------------------------------------- transport ---
+class Transport:
+    """Runs shell commands either locally or on a remote Linux computer over SSH, and knows how
+    to resolve the iPod's (unstable) block node by SCSI model."""
+
+    def __init__(self, mode, pi):
+        self.mode = mode            # "local" | "ssh"
+        self.pi = pi                # user@host when mode == "ssh", else None
+        self._dev = os.environ.get("IPOD_DEV")
+
+    @property
+    def desc(self):
+        return "local" if self.mode == "local" else f"ssh {self.pi}"
+
+    def sh(self, cmd, capture=False, check=True):
+        full = cmd if self.mode == "local" else ["ssh", self.pi, cmd if isinstance(cmd, str) else " ".join(cmd)]
+        if self.mode == "local" and isinstance(cmd, str):
+            full = ["bash", "-c", cmd]
+        if capture:
+            return subprocess.run(full, capture_output=True, text=True).stdout
+        return subprocess.run(full, check=check)
+
+    def dev(self):
+        if not self._dev:
+            out = self.sh(r"""lsblk -dno NAME,MODEL 2>/dev/null | awk 'tolower($0) ~ /ipod/ {print "/dev/"$1; exit}'""",
+                          capture=True).strip()
+            self._dev = out or "/dev/sda"
+        return self._dev
+
+    def peek(self, addr, n=0x200):
+        """Return n bytes of iPod DRAM via the custom SCSI peek (c6 96 02).
+
+        the iPod only needs to be attached to its Linux computer — ANY mode, including the
+        normal home screen; it does NOT need to be in Connected/disk mode. A read
+        does occasionally come back all-zero before the device settles, so retry
+        each 512-byte chunk and take the first result that has a non-zero byte
+        (genuinely-zero memory falls through after the retries)."""
+        import base64
+        dev = self.dev()
+        out = bytearray()
+        for off in range(0, n, 0x200):
+            a = addr + off
+            ab = " ".join(f"{(a >> s) & 0xff:02x}" for s in (24, 16, 8, 0))
+            cmd = (f"for i in $(seq 1 8); do "
+                   f"sudo sg_raw -o /tmp/nano_peek.bin -r 512 {dev} c6 96 02 {ab} >/dev/null 2>&1 "
+                   f"&& od -An -t x1 /tmp/nano_peek.bin | tr -d ' \\n' | grep -qv '^0*$' && break; "
+                   f"sleep 0.3; done; base64 /tmp/nano_peek.bin 2>/dev/null")
+            b64 = self.sh(cmd, capture=True).strip()
+            try:
+                chunk = base64.b64decode(b64)
+            except Exception:
+                chunk = b""
+            chunk = (chunk + b"\0" * 0x200)[:min(0x200, n - off)]
+            out += chunk
+        return bytes(out)
+
+    # ---- disk-mode media/file pulls (mount the FAT partition, not SCSI peek) ----
+    # All three run ON the device host (local or over SSH) through one bash snippet,
+    # so the same code path works whether the iPod is attached to this computer or a remote one.
+    PULL_TMP = "/tmp/nano_pull"
+
+    def _mount_pull(self, globs):
+        """Switch the iPod to disk mode, mount its FAT partition read-only, copy
+        every file matching `globs` (shell globs relative to the mount root) into
+        PULL_TMP on the device host, unmount. Returns the file count, or -1 if the
+        mount failed."""
+        dev = self.dev(); part = dev + "1"
+        cps = "; ".join(f'cp {g} "$T"/ 2>/dev/null || true' for g in globs)
+        script = (
+            f'set -u; dev={dev}; part={part}; mnt=/mnt/nanoapps-ipod; T={self.PULL_TMP}; '
+            f'sudo sg_start "$dev" --loej 2>/dev/null || true; '
+            f'for i in $(seq 1 30); do test -e "$part" && break; sleep 1; done; '
+            f'sudo fsck.vfat -a "$part" >/dev/null 2>&1 || true; '
+            f'sudo mkdir -p "$mnt"; sudo umount "$part" 2>/dev/null || true; '
+            f'ok=; for i in $(seq 1 20); do sudo mount -o ro,flush "$part" "$mnt" 2>/dev/null && {{ ok=1; break; }}; sleep 1; done; '
+            f'[ -n "$ok" ] || {{ echo MOUNT_FAILED; exit 1; }}; '
+            f'rm -rf "$T"; mkdir -p "$T"; cd "$mnt"; {cps}; '
+            f'chmod 644 "$T"/* 2>/dev/null || true; sudo umount "$mnt" 2>/dev/null || true; '
+            f'ls "$T" 2>/dev/null | wc -l')
+        out = self.sh(script, capture=True)
+        if "MOUNT_FAILED" in out:
+            return -1
+        try:
+            return int(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    def _fetch(self, local_dir):
+        """Bring PULL_TMP/* off the device host into local_dir (a no-op copy when
+        we're already local, scp when the iPod is on a remote Linux computer)."""
+        os.makedirs(local_dir, exist_ok=True)
+        if self.mode == "local":
+            subprocess.run(f'cp {self.PULL_TMP}/* "{local_dir}"/ 2>/dev/null || true', shell=True)
+        else:
+            subprocess.run(f"scp -q {self.pi}:{self.PULL_TMP}/'*' \"{local_dir}\"/ 2>/dev/null || true",
+                           shell=True)
+
+    def _clear_device(self, globs):
+        """Remount rw and delete files matching `globs`, then eject. Only call once
+        the originals are safely copied to the host."""
+        dev = self.dev(); part = dev + "1"
+        rms = "; ".join(f'sudo rm -f {g} 2>/dev/null || true' for g in globs)
+        script = (
+            f'set -u; dev={dev}; part={part}; mnt=/mnt/nanoapps-ipod; '
+            f'sudo umount "$part" 2>/dev/null || true; '
+            f'sudo mount -o rw,flush "$part" "$mnt" 2>/dev/null || {{ echo RW_FAILED; exit 1; }}; '
+            f'cd "$mnt"; {rms}; sync; sudo umount "$mnt" 2>/dev/null || true; '
+            f'sudo eject "$dev" 2>/dev/null || sudo sg_start "$dev" --loej 2>/dev/null || true; '
+            f'echo CLEARED')
+        return "CLEARED" in self.sh(script, capture=True)
+
+    # ---- payload upload + exec over the custom SCSI channel (c6 96 ..) --------
+    # These run sudo sg_raw on the device host (local or over SSH) exactly like
+    # peek(), so NOTHING needs the repo checked out on the iPod.s Linux computer anymore.
+    def eject(self):
+        """Leave Connected mode so the iPod mounts its filesystem / reaches home."""
+        self.sh(f"sudo eject {self.dev()} 2>/dev/null || true", check=False)
+
+    def wait_connected(self):
+        """Kick the iPod into Connected (mass-storage) mode and wait for the node
+        to appear (a prior deploy leaves it ejected)."""
+        dev = self.dev()
+        self.sh(f"sudo sg_start {dev} --loej 2>/dev/null || true", check=False)
+        return self.sh(f"for i in $(seq 1 40); do test -e {dev} && exit 0; sleep 2; done; exit 1",
+                       check=False).returncode == 0
+
+    def stage(self, local, remote):
+        """Place a local file/dir at `remote` on the device host (overwriting)."""
+        if self.mode == "local":
+            if os.path.realpath(local) != os.path.realpath(remote):
+                self.sh(f'rm -rf "{remote}"; mkdir -p "$(dirname "{remote}")"; cp -r "{local}" "{remote}"')
+        else:
+            self.sh(f'rm -rf "{remote}"; mkdir -p "$(dirname "{remote}")"')
+            subprocess.run(["scp", "-qr", local, f"{self.pi}:{remote}"], check=True)
+
+    def scsi_write_file(self, local_bin, addr):
+        """Upload a local file into iPod DRAM at `addr` in 512-byte chunks via the
+        custom write command (c6 96 01). The bytes are shuttled to the device host
+        first (a no-op when local), then a self-contained loop drives sg_raw."""
+        dev = self.dev()
+        remote = local_bin if self.mode == "local" else "/tmp/nano_payload.bin"
+        if self.mode != "local":
+            subprocess.run(["scp", "-q", local_bin, f"{self.pi}:{remote}"], check=True)
+        script = (
+            f'set -e; F="{remote}"; DEV={dev}; CH=512; A={addr}; '
+            f'sz=$(stat -c %s "$F" 2>/dev/null || stat -f %z "$F"); '
+            f'pad=$(( (sz + CH - 1) / CH * CH )); P=$(mktemp); cp "$F" "$P"; '
+            f'[ "$pad" -gt "$sz" ] && dd if=/dev/zero bs=1 count=$((pad-sz)) >>"$P" 2>/dev/null; '
+            f'C=$(mktemp); n=$(( pad / CH )); '
+            f'for i in $(seq 0 $((n-1))); do '
+            f'  dd if="$P" of="$C" bs=$CH count=1 skip=$i 2>/dev/null; '
+            f'  cur=$(( A + i*CH )); '
+            f'  ab=$(printf "%02x %02x %02x %02x" $(((cur>>24)&255)) $(((cur>>16)&255)) $(((cur>>8)&255)) $((cur&255))); '
+            f'  sudo sg_raw -s $CH -i "$C" "$DEV" c6 96 01 $ab >/dev/null 2>&1; '
+            f'done; rm -f "$P" "$C"; echo "uploaded $sz bytes to {hex(addr)}"')
+        self.sh(script)
+
+    def scsi_exec(self, addr):
+        """Call `addr` as code on the device (c6 96 03). Pass addr|1 for Thumb."""
+        dev = self.dev()
+        ab = " ".join(f"{(addr >> s) & 0xff:02x}" for s in (24, 16, 8, 0))
+        self.sh(f'sudo sg_raw -o /dev/null -r 512 {dev} c6 96 03 {ab} >/dev/null 2>&1; '
+                f'echo "exec returned for {hex(addr)}"', check=False)
+
+
+def _local_ipod():
+    """True if an iPod block device is attached to THIS (Linux) machine."""
+    return platform.system() == "Linux" and subprocess.run(
+        ["bash", "-c", "lsblk -dno MODEL 2>/dev/null | grep -qi ipod"]).returncode == 0
+
+
+def setup_transport(persist=True):
+    """First-run (or `start setup`) prompt: where is the iPod attached? Persist the
+    answer to CONFIG_FILE so later commands don't ask again."""
+    if not sys.stdin.isatty():
+        sys.exit("start: no transport configured. Run `start setup`, or pass "
+                 "--local / --remote user@host (the iPod's machine).")
+    print("start setup — where is the iPod attached?")
+    print("  1. This machine (iPod plugged into THIS computer; requires Linux)")
+    print("  2. A remote Linux host over SSH (e.g. a Raspberry Pi)")
+    choice = input("choose [1/2]: ").strip()
+    cfg = load_config()
+    if choice == "1":
+        if platform.system() != "Linux":
+            sys.exit(f"start: this computer is {platform.system()}, but local SCSI access "
+                     "needs Linux (sg_raw). Choose option 2 and attach the iPod to a "
+                     "Linux host (such as a Raspberry Pi) over SSH.")
+        cfg["MODE"] = "local"; cfg.pop("REMOTE", None); cfg.pop("PI", None)
+        if persist: save_config(cfg); print(f"saved -> {CONFIG_FILE} (local)")
+        return Transport("local", None)
+    host = input("  SSH host (user@host): ").strip()
+    if not host:
+        sys.exit("no host given")
+    cfg["MODE"] = "ssh"; cfg["REMOTE"] = host; cfg.pop("PI", None)
+    if persist:
+        save_config(cfg)
+        print(f"saved -> {CONFIG_FILE} (ssh {host}); change later with `start setup`")
+    return Transport("ssh", host)
+
+
+def detect_transport(args, need_device=True):
+    """Resolve the transport. Precedence: --local / --remote flag, then $REMOTE
+    env, then a directly-attached iPod, then the saved config, else (for device
+    ops) the first-run setup prompt."""
+    if getattr(args, "local", False):
+        if platform.system() != "Linux":
+            sys.exit(f"start: --local needs Linux for SCSI (this is {platform.system()}); "
+                     "use --remote user@host to reach the iPod's Linux computer.")
+        return Transport("local", None)
+    if getattr(args, "remote", None):
+        return Transport("ssh", args.remote)
+    env_remote = os.environ.get("REMOTE") or os.environ.get("PI")
+    if env_remote:
+        return Transport("ssh", env_remote)
+    if _local_ipod():
+        return Transport("local", None)
+    cfg = load_config()
+    if cfg.get("MODE") == "local":
+        return Transport("local", None)
+    if cfg.get("REMOTE") or cfg.get("PI"):
+        return Transport("ssh", cfg.get("REMOTE") or cfg["PI"])
+    if not need_device:                 # build-only: no device, don't prompt
+        return Transport("local", None)
+    return setup_transport()
+
+
+# ------------------------------------------------------------------ targets ---
+def resolve_target(name):
+    for tree in ("apps", "system", "harnesses"):
+        if (ROOT / tree / name).is_dir():
+            return f"{tree}/{name}"
+    sys.exit(f"no such target: {name} (apps/ system/ harnesses/)")
+
+
+# ----------------------------------------------------------------- commands ---
+NONAPPS = ("silver_resident",)
+
+# Scaffolding templates: each app KIND maps to the closest existing app to clone.
+#   lvgl: LVGL widget surface (HBAppKind 1)
+#   gl:   OpenGL ES surface   (HBAppKind 2)
+#   raw:  direct-framebuffer surface, Paint-style (HBAppKind 1)
+APP_TEMPLATES = {"lvgl": "clock", "gl": "opengl", "raw": "paint"}
+
+
+def _app_dirs():
+    """Every packaged surface app (apps/ dir with a Makefile, minus the resident)."""
+    return [d.name for d in sorted((ROOT / "apps").iterdir())
+            if (d / "Makefile").is_file() and d.name not in NONAPPS]
+
+
+def cmd_new(args):
+    """Scaffold a new app by cloning the closest existing one of the chosen KIND,
+    rewriting its name + identity (folder, source, Makefile APP_NAME, and the
+    Info.plist bundle id / name / executable) so it's a distinct app to start from."""
+    name = (args.name or "").strip().lower()
+    if not name or name[0].isdigit() or not all(c.islower() or c.isdigit() or c == "_" for c in name):
+        sys.exit("app name must be lowercase letters/digits/underscore and not start with a digit")
+    dst = ROOT / "apps" / name
+    if dst.exists():
+        sys.exit(f"apps/{name} already exists")
+
+    tmpl = getattr(args, "frm", None) or APP_TEMPLATES.get(args.kind)
+    src = ROOT / "apps" / tmpl
+    if not src.is_dir() or not (src / "Makefile").is_file():
+        sys.exit(f"template app apps/{tmpl} not found")
+    tmpl_c = src / f"{tmpl}.c"
+    if not tmpl_c.is_file():
+        cs = sorted(src.glob("*.c"))
+        if not cs:
+            sys.exit(f"apps/{tmpl} has no .c source to clone")
+        tmpl_c = cs[0]
+    display = args.title or name.replace("_", " ").title()
+
+    dst.mkdir(parents=True)
+    # 1. source — verbatim copy (the dev edits the body; entry symbols are generic)
+    (dst / f"{name}.c").write_text(tmpl_c.read_text())
+    # 2. Makefile — keep the surface flag, rewrite APP_NAME + SRCS
+    mk = (src / "Makefile").read_text()
+    mk = re.sub(r"(?m)^APP_NAME\s*:=.*$", f"APP_NAME := {name}", mk)
+    mk = re.sub(r"(?m)^SRCS\s*:=.*$", f"SRCS     := {name}.c", mk)
+    (dst / "Makefile").write_text(mk)
+    # 3. Info.plist — new identity (id / display name / executable); keep kind + icon
+    import plistlib
+    old = plistlib.loads((src / "Info.plist").read_bytes())
+    pl = (src / "Info.plist").read_text()
+    pl = pl.replace(f">{old['CFBundleIdentifier']}<", f">org.nanoapps.{name}<")
+    pl = pl.replace(f">{old['CFBundleName']}<", f">{display}<")
+    pl = pl.replace(f">{old['CFBundleExecutable']}<", f">{name}<")
+    (dst / "Info.plist").write_text(pl)
+
+    print(f"created apps/{name}  (kind: {args.kind}, cloned from {tmpl})")
+    print(f"  apps/{name}/{name}.c        — your code (a copy of {tmpl}.c; edit freely)")
+    print(f"  apps/{name}/Makefile        — APP_NAME={name}")
+    print(f"  apps/{name}/Info.plist      — org.nanoapps.{name} / \"{display}\"")
+    print("\nnext:")
+    print(f"  ./start build {name}        # compile it")
+    print(f"  ./start install {name}      # install it (+resident) to the home screen, then tap its icon")
+
+
+def cmd_build(args):
+    ensure_build_deps()
+    if args.targets:
+        rels = [resolve_target(t) for t in args.targets]
+    else:
+        # both trees, sequential so the first LVGL build warms liblvgl.a before the
+        # rest reuse it (parallel would race on the archive output).
+        rels = []
+        for tree in ("apps", "harnesses"):
+            for d in sorted((ROOT / tree).iterdir()):
+                if (d / "Makefile").is_file():
+                    rels.append(f"{tree}/{d.name}")
+    print(f"==> building {len(rels)} target(s)")
+    fails = 0
+    for rel in rels:
+        name = Path(rel).name
+        # capture output so a failure can show the real error (and leaves a log
+        # behind); surface apps emit a .hbapp, plain SDK apps a .bin.
+        res = subprocess.run(["make", "-C", str(ROOT / rel)],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        ok = res.returncode == 0
+        out = ROOT / rel / "build" / f"{name}.hbapp"
+        if not out.is_file():
+            out = ROOT / rel / "build" / f"{name}.bin"
+        sz = f"{out.stat().st_size} bytes" if out.is_file() else "(no output)"
+        print(f"  {rel:<34} {'ok  ' + sz if ok else 'FAILED'}")
+        if not ok:
+            fails += 1
+            log = ROOT / rel / "build" / "build.log"
+            try:
+                log.parent.mkdir(parents=True, exist_ok=True)
+                log.write_text(res.stdout or "")
+            except OSError:
+                log = None
+            tail = "\n".join((res.stdout or "").rstrip().splitlines()[-12:])
+            if tail:
+                print("\n".join("        " + ln for ln in tail.splitlines()))
+            if log:
+                print(f"        (full log: {log})")
+    if fails:
+        print(f"==> {fails} target(s) FAILED")
+
+
+def is_app_target(rel):
+    """An installable surface app == an apps/ dir that the pack ships (not the
+    resident). Everything else (harnesses/, system/) is a one-shot exec."""
+    return rel.startswith("apps/") and Path(rel).name not in NONAPPS
+
+
+# ---- link address + one-shot SCSI exec ---------------------------------------
+def _link_va(elf):
+    """LINK_VA == the .text load address baked into the ELF by the linker script
+    (works whether the app set LVGL_ENABLE or overrode LINK_VA directly). The
+    resident links at 0x09130000, plain SDK apps at 0x0867f8e4 — getting this wrong
+    uploads + execs the binary at the wrong address and crashes the device, so
+    parse readelf in Python rather than a fragile shell/awk pipeline.
+
+      readelf -S line:  [ 1] .text  PROGBITS  09130000 001000 ...
+                              ^name  ^type     ^addr
+    """
+    out = subprocess.run(["arm-none-eabi-readelf", "-S", str(elf)],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        parts = line.split()
+        if ".text" in parts:
+            i = parts.index(".text")
+            try:
+                return int(parts[i + 2], 16)          # name, type, addr
+            except (IndexError, ValueError):
+                continue
+    return 0x0867f8e4
+
+
+def _push_run(tr, name):
+    """Build one target, upload its .bin to RAM and call it as Thumb code, then
+    eject so taps reach the home screen. Drives sg_raw over the transport — no repo
+    on the iPod.s Linux computer required."""
+    rel = None
+    for t in ("apps", "system", "harnesses", "wip"):
+        if (ROOT / t / name).is_dir():
+            rel = f"{t}/{name}"; break
+    if not rel:
+        sys.exit(f"no such target: {name} (apps/ system/ harnesses/ wip/)")
+    print(f"==> build {name}")
+    subprocess.run(["make", "-s", "-C", str(ROOT / rel)], check=True)
+    binp = ROOT / rel / "build" / f"{name}.bin"
+    if not binp.is_file():
+        # surface apps build a relocatable .hbapp, not a fixed-VA .bin — they can't
+        # be run standalone; they launch from the home screen via the pack.
+        if (ROOT / rel / "build" / f"{name}.hbapp").is_file():
+            sys.exit(f"{name} is a surface app (.hbapp) — it can't run standalone; "
+                     f"use `./start install {name}` to put it on the home screen.")
+        sys.exit(f"no {binp}")
+    link_va = _link_va(ROOT / rel / "build" / f"{name}.elf")
+    print(f"==> {name}.bin = {binp.stat().st_size} bytes, LINK_VA = {hex(link_va)}, dev = {tr.dev()}")
+    if not tr.wait_connected():
+        sys.exit(f"{tr.dev()} never appeared — put the iPod in Connected mode")
+    # unmount + eject so the FS is quiescent, then upload + exec, then eject again
+    # (the SCSI exec re-enters Connected mode; the post-eject lands us on home).
+    tr.sh(f"sudo umount {tr.dev()}1 2>/dev/null; sudo umount {tr.dev()} 2>/dev/null; true", check=False)
+    tr.eject()
+    time.sleep(3)
+    tr.scsi_write_file(str(binp), link_va)
+    tr.scsi_exec(link_va | 1)
+    tr.eject()
+
+
+# ---- disk install ------------------------------------------------------------
+def _fat_mount_prep(dev, part, mnt):
+    """Bash that puts the iPod in Connected mode and mounts its FAT partition
+    READ-WRITE at `mnt`. A panic or unclean eject leaves the FAT 'dirty', and
+    Linux then mounts it read-only EVEN with -o rw — so we clear the dirty bit with
+    fsck BEFORE mounting, then verify the mount is actually writable (touch test)
+    and remount via fsck if it came up read-only."""
+    return f"""set -e
+sudo sg_start {dev} --loej 2>/dev/null || true
+for i in $(seq 1 40); do test -e {part} && break; sleep 1; done
+test -e {part} || {{ echo 'device never appeared in Connected mode' >&2; exit 1; }}
+udisksctl unmount -b {part} 2>/dev/null || sudo umount {part} 2>/dev/null || true
+sudo fsck.vfat -a -w {part} >/dev/null 2>&1 || true   # clear the dirty bit up front
+sudo mkdir -p {mnt}
+mounted=
+for i in $(seq 1 6); do
+  sudo umount {mnt} 2>/dev/null || true
+  if sudo mount -o rw,flush {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
+    sudo rm -f {mnt}/.hbrw; mounted=1; break
+  fi
+  sudo umount {mnt} 2>/dev/null || true
+  sudo fsck.vfat -a -w {part} >/dev/null 2>&1 || true
+  sleep 1
+done
+[ -n "$mounted" ] || {{ echo 'could not mount the iPod read-write (FAT may be corrupt) - run: ./start fsck' >&2; exit 1; }}
+"""
+
+
+def _install_disk(tr, src, data, data_force):
+    """Mount the iPod's FAT partition and write the staged /Apps tree. Preserves
+    /Apps/Data; sweeps retired layouts. Never DRAM-stages (that white-screens the
+    live OS)."""
+    stage = "/tmp/hbapps"
+    tr.stage(f"{src}/Apps", f"{stage}/Apps")
+    if (data or data_force) and (ROOT / "data").is_dir():
+        tr.stage(str(ROOT / "data"), f"{stage}/data")
+    dev = tr.dev(); part = dev + "1"
+    mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
+    force = "1" if data_force else ""
+    copy = f"""# Replace the app payload but PRESERVE {mnt}/Apps/Data, and sweep retired layouts
+# (old /iPod_Control/hb*, hbapps/hbicons names, /Apps/*.app bundles).
+sudo rm -rf {mnt}/iPod_Control/hbapps {mnt}/iPod_Control/hbicons {mnt}/iPod_Control/hbapps.pack 2>/dev/null || true
+sudo rm -rf {mnt}/Apps/hbapps {mnt}/Apps/hbicons {mnt}/Apps/hbapps.pack {mnt}/Apps/*.app 2>/dev/null || true
+sudo rm -rf {mnt}/Apps/AllApps.pack {mnt}/Apps/Executables {mnt}/Apps/Icons 2>/dev/null || true
+sudo mkdir -p {mnt}/Apps
+sudo cp {stage}/Apps/AllApps.pack {mnt}/Apps/AllApps.pack
+sudo cp -r {stage}/Apps/Executables {mnt}/Apps/Executables
+sudo cp -r {stage}/Apps/Icons {mnt}/Apps/Icons
+if [ -d {stage}/data ]; then
+  sudo mkdir -p {mnt}/Apps/Data
+  for d in {stage}/data/*/; do
+    [ -d "$d" ] || continue
+    n=$(basename "$d")
+    if [ -d "{mnt}/Apps/Data/$n" ] && [ -z "{force}" ]; then
+      echo "  data: keep $n (already on device)"
+    else
+      sudo rm -rf "{mnt}/Apps/Data/$n"; sudo cp -r "$d" "{mnt}/Apps/Data/$n"; echo "  data: copied $n"
+    fi
+  done
+fi
+sudo sync
+echo "/Apps/Executables: $(ls {mnt}/Apps/Executables | wc -l | tr -d ' ')"
+[ -d {mnt}/Apps/Data ] && echo "/Apps/Data folders: $(ls {mnt}/Apps/Data | wc -l | tr -d ' ')"
+sudo umount {mnt}
+echo 'apps installed to disk'"""
+    tr.sh(_fat_mount_prep(dev, part, mnt) + copy)
+
+
+# ---- full app deploy ---------------------------------------------------------
+def _deploy_apps(tr, names, data, data_force, resident_only):
+    print("==> [1/5] build resident")
+    subprocess.run(["make", "-s", "-C", str(ROOT / "system" / "silver_resident")], check=True)
+
+    if resident_only:
+        print("==> [2/5] skip app build (resident only)")
+    else:
+        build = names or _app_dirs()
+        print(f"==> [2/5] build {len(build)} app(s)")
+        failed = []
+        for a in build:
+            if subprocess.run(["make", "-s", "-C", str(ROOT / "apps" / a)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                print(f"    {a:<18} ok")
+            else:
+                print(f"    {a:<18} FAIL"); failed.append(a)
+        # Only abort if the user NAMED an app that failed; an all-apps build tolerates
+        # the odd non-packaged probe that doesn't compile (build_apps.py packs only
+        # apps that emitted a .hbapp).
+        if failed and names:
+            sys.exit(f"!! named target(s) failed: {', '.join(failed)}")
+
+    print("==> [3/5] pack")
+    subprocess.run(["python3", str(ROOT / "tools" / "build_apps.py")], check=True)
+
+    print("==> [4/5] install to iPod disk")
+    if data_force:   print("    (seeding data/ -> /Apps/Data, OVERWRITING existing)")
+    elif data:       print("    (seeding data/ -> /Apps/Data, keeping existing)")
+    _install_disk(tr, "/tmp/hbapps", data, data_force)
+
+    # install_disk only writes files; nothing on the home screen changes until the
+    # resident is re-exec'd to register the icons + on-tap loader.
+    print("==> [5/5] exec resident")
+    _push_run(tr, "silver_resident")
+    print("\n==> All done! On the iPod, wait for the Home Screen, then open any built-in")
+    print("    app (like Music or Settings) and head back Home, and your apps will appear.")
+    print("    Your apps need re-registering each time the iPod restarts. To do it,")
+    print(f"    just run this again and choose \"Install resident only\":")
+    print(f"      {ROOT / 'start'}")
+
+
+def cmd_install(args, tr):
+    """Install to the iPod over whichever transport (local or remote-over-SSH). App
+    targets (or none) go through the pack pipeline; harness/system targets are
+    built + SCSI-exec'd once — so `start install <harness>` deploys a harness too."""
+    ensure_build_deps()
+    ensure_device_deps(tr)          # auto-install the iPod-machine's SCSI/FAT tools
+    targets = list(getattr(args, "targets", []) or [])
+    app_targets, oneshot = [], []
+    for t in targets:
+        rel = resolve_target(t)
+        (app_targets if is_app_target(rel) else oneshot).append((t, rel))
+
+    for t, rel in oneshot:                       # harnesses, probes — one-shot exec
+        print(f"==> install (one-shot exec) {rel}")
+        _push_run(tr, Path(rel).name)
+
+    # app set — run when no targets at all, or at least one app target was named
+    if not targets or app_targets:
+        data = bool(getattr(args, "demo_data", False))
+        data_force = bool(getattr(args, "demo_data_force", False))
+        resident_only = bool(getattr(args, "resident_only", False))
+        names = [t for t, _ in app_targets]
+        note = " +demo-data(force)" if data_force else (" +demo-data" if data else "")
+        print(f"==> install ({tr.desc}){note} {' '.join(names) or '[all apps]'}")
+        _deploy_apps(tr, names, data, data_force, resident_only)
+
+
+def _remote_install(tr, names):
+    """Install a package on the remote Linux computer, picking its package manager
+    (names is a {manager: package} dict, or a str for all)."""
+    if isinstance(names, str):
+        names = {m: names for m in ("apt-get", "dnf", "pacman", "zypper")}
+    tr.sh(
+        f'if command -v apt-get >/dev/null; then sudo apt-get install -y {names.get("apt-get","")}; '
+        f'elif command -v dnf >/dev/null; then sudo dnf install -y {names.get("dnf","")}; '
+        f'elif command -v pacman >/dev/null; then sudo pacman -S --noconfirm {names.get("pacman","")}; '
+        f'elif command -v zypper >/dev/null; then sudo zypper install -y {names.get("zypper","")}; '
+        f'else echo "no supported package manager on the remote"; fi', check=False)
+
+
+def cmd_bootstrap(args, tr):
+    """Discover (and unless --check, install) every dependency needed to build the
+    firmware on this computer and drive the iPod over SCSI on the iPod's machine."""
+    check_only = getattr(args, "check", False)
+    darwin = platform.system() == "Darwin"
+    print(f"start: install dependencies — transport: {tr.desc}"
+          f"{'  [check only]' if check_only else ''}\n")
+    missing = []
+
+    def host_tool(label, present, brew=None, linux=None, pip=None):
+        """linux = {manager: package} (or a str) so dnf/pacman/zypper machines work
+        too, not just apt."""
+        print(f"  {label:<22} {'ok' if present else 'MISSING'}")
+        if present:
+            return
+        if check_only:
+            missing.append(label); return
+        if pip:
+            _pip_install(pip)
+        elif darwin and _have("brew") and brew:
+            _run(["brew", "install", *brew.split()])
+        elif not darwin and linux and _linux_install(linux):
+            pass
+        else:
+            print(f"    -> install '{label}' manually"); missing.append(label)
+
+    print("[this computer] build + shuttle deps")
+    host_tool("arm-none-eabi-gcc", _have("arm-none-eabi-gcc"),
+              brew="arm-none-eabi-gcc",
+              linux={"apt-get": "gcc-arm-none-eabi", "dnf": "arm-none-eabi-gcc-cs",
+                     "pacman": "arm-none-eabi-gcc", "zypper": "cross-arm-none-eabi-gcc"})
+    host_tool("make", _have("make"), brew="make", linux="make")
+    host_tool("git", _have("git"), brew="git", linux="git")
+    # native C compiler — Rust/cargo links silverutil through it (the ARM gcc above
+    # can't link a host binary). macOS gets it from the Xcode Command Line Tools.
+    host_tool("cc (host linker)", _have("cc") or _have("gcc") or _have("clang"),
+              brew=None, linux={"apt-get": "gcc", "dnf": "gcc", "pacman": "gcc", "zypper": "gcc"})
+    host_tool("cargo (Rust)", _have("cargo"), brew="rust", linux=RUST_PKGS)
+    import importlib.util
+    host_tool("python3 Pillow", importlib.util.find_spec("PIL") is not None, pip="pillow")
+    host_tool("rsync", _have("rsync"), brew="rsync", linux="rsync")
+    host_tool("ssh", _have("ssh"), brew="openssh",
+              linux={"apt-get": "openssh-client", "dnf": "openssh-clients",
+                     "pacman": "openssh", "zypper": "openssh"})
+
+    print("\n[lvgl] stock upstream checkout")
+    if not setup_lvgl(check_only=check_only):
+        missing.append("lvgl/")
+
+    print("\n[fontawesome] icon glyph set (for home icons)")
+    if not setup_fontawesome(check_only=check_only):
+        missing.append("fontawesome/")
+
+    # The iPod's machine needs the SCSI transport tools + FAT mount/repair (the disk
+    # install mounts the iPod's FAT partition and fsck.vfat's it when a panic left it
+    # dirty) — see module-level DEVTOOLS.
+    devtools = DEVTOOLS
+
+    print("\n[device] SCSI transport deps on the iPod's machine")
+    if tr.mode == "ssh":
+        reachable = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", tr.pi, "true"]
+        ).returncode == 0
+        if not reachable:
+            print(f"  ssh {tr.pi:<18} UNREACHABLE -> run: ssh-copy-id {tr.pi}")
+            missing.append(f"ssh:{tr.pi}")
+        else:
+            for tool, pkgs in devtools:
+                # include the sbin dirs: a non-login ssh PATH usually omits them, so
+                # fsck.vfat / mount (in /sbin) would look "missing" though installed.
+                ok = tr.sh(f"PATH=/usr/sbin:/sbin:$PATH command -v {tool} >/dev/null 2>&1 && echo y",
+                           capture=True).strip() == "y"
+                print(f"  remote:{tool:<15} {'ok' if ok else 'MISSING'}")
+                if not ok:
+                    if check_only:
+                        missing.append(f"remote:{tool}")
+                    else:
+                        _remote_install(tr, pkgs)
+    elif darwin:
+        # macOS is never the iPod's host (no sg_raw). The device tools live on the
+        # iPod's Linux computer — point the user at setup instead of "installing".
+        print("  (skipped — macOS can't drive SCSI; the iPod's Linux computer holds"
+              " these. Run `start setup` to point start at it.)")
+    else:
+        # local transport == you're ON the iPod's Linux computer: the device tools
+        # are needed right here.
+        for tool, pkgs in devtools:
+            host_tool(tool, _have(tool),
+                      brew="sg3_utils" if tool.startswith("sg_") else None,
+                      linux=pkgs)
+
+    print()
+    if missing:
+        print(f"install dependencies: {len(missing)} item(s) still missing: {', '.join(missing)}")
+        if check_only:
+            print("re-run `start deps` (without --check) to install them")
+    else:
+        print("install dependencies: all present — ready to `start install`")
+
+
+def cmd_run(args, tr):
+    _push_run(tr, Path(resolve_target(args.target)).name)
+
+
+def cmd_eject(args, tr):
+    """Leave Connected mode so the iPod mounts its filesystem / returns to home
+    (needed once before the FS-mode SDK APIs work)."""
+    tr.eject()
+    print(f"requested eject for {tr.dev()} — wait for the home screen before using FS APIs")
+
+
+def cmd_fsck(args, tr):
+    """Repair the iPod's FAT filesystem. A panic or unclean eject can leave the
+    FAT marked 'dirty', which makes Linux mount it READ-ONLY (installs then fail
+    with 'Read-only file system'). This clears that and verifies a read-write
+    mount."""
+    dev = tr.dev(); part = dev + "1"
+    mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
+    print(f"==> repairing {part} on the iPod's computer")
+    script = f"""sudo sg_start {dev} --loej 2>/dev/null || true
+for i in $(seq 1 40); do test -e {part} && break; sleep 1; done
+test -e {part} || {{ echo 'device never appeared in Connected mode' >&2; exit 1; }}
+udisksctl unmount -b {part} 2>/dev/null || sudo umount {part} 2>/dev/null || true
+sudo fsck.vfat -a -w -v {part} 2>&1 | tail -20 || sudo fsck.vfat -a -w {part} || true
+echo '--- verifying read-write mount ---'
+sudo mkdir -p {mnt}
+if sudo mount -o rw,flush {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
+  sudo rm -f {mnt}/.hbrw; sudo umount {mnt}; echo 'OK: the iPod filesystem is healthy and writable'
+else
+  sudo umount {mnt} 2>/dev/null || true
+  echo 'STILL not writable — the FAT may need a deeper repair (back up + reformat the data partition from a PC)'; exit 1
+fi"""
+    rc = tr.sh(script, check=False).returncode
+    tr.eject()              # back to the home screen
+    if rc != 0:
+        sys.exit(1)
+
+
+def cmd_remount(args, tr):
+    """Put the iPod into Connected (mass-storage) mode and mount its FAT partition
+    read-write on the iPod's computer (the inverse of eject)."""
+    dev = tr.dev(); part = dev + "1"
+    mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
+    print(f"==> mounting {part} read-write at {mnt}")
+    tr.sh(_fat_mount_prep(dev, part, mnt) + f"echo 'mounted read-write at {mnt}'")
+
+
+def cmd_setup(args):
+    """(Re)configure where the iPod is attached and persist it to CONFIG_FILE."""
+    setup_transport()
+
+
+def cmd_peek(args, tr):
+    n = int(args.n, 0) if isinstance(args.n, str) else args.n
+    data = tr.peek(int(args.addr, 0), n)
+    for off in range(0, len(data), 16):
+        row = data[off:off + 16]
+        hexs = " ".join(f"{b:02x}" for b in row)
+        asci = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        print(f"{int(args.addr,0)+off:08x}  {hexs:<48}  {asci}")
+
+
+def cmd_trace(args, tr):
+    data = tr.peek(TRACE_RING, 9 * 0x200)
+    if len(data) < 16:
+        sys.exit(f"peek returned no data — check the iPod is attached ({tr.desc})")
+    magic, idx, count, _ = struct.unpack_from("<IIII", data, 0)
+    if magic != TRACE_MAGIC:
+        sys.exit("trace ring magic is %08x, not 'RTBH' — the resident hasn't logged yet "
+                 "(or DRAM was cleared by a cold boot)" % magic)
+    cap = (len(data) - 16) // 16          # ring slot count
+    n = min(count, cap)
+    tail = min(args.n, n)
+    print(f"HBTR idx={idx} count={count}  (last {tail} of {n}, oldest first)")
+    # circular ring: the newest entry is slot (idx-1); walk back `tail` then print
+    # oldest-first so the LAST printed line is the most recent.
+    slots = [(idx - 1 - k) % cap for k in range(tail)][::-1]
+    for s in slots:
+        o = 16 + s * 16
+        tag = data[o:o + 8].rstrip(b" \x00").decode("ascii", "replace")
+        v1, v2 = struct.unpack_from("<II", data, o + 8)
+        print(f"{tag:<8} 0x{v1:08x} 0x{v2:08x}")
+
+
+def cmd_pull(args, tr):
+    """Pull files off the iPod's FAT disk (over whichever transport). `media` grabs
+    screenshots + recordings, converts them, and clears them from the device;
+    `bench` grabs the benchmark CSVs into bench_results/. Conversion is done here
+    with Pillow + recsplit.py so it works on Linux and macOS alike."""
+    what = getattr(args, "what", "media") or "media"
+
+    if what == "bench":
+        out = ROOT / "bench_results"; out.mkdir(exist_ok=True)
+        n = tr._mount_pull(["Apps/Data/Bench/bench_*.csv"])
+        if n < 0:
+            sys.exit("could not mount the iPod (disk mode?) — try replugging")
+        if n == 0:
+            print("no benchmark CSVs on the device"); return
+        tr._fetch(str(out))
+        csvs = sorted(out.glob("bench_*.csv"))
+        print(f"==> pulled {len(csvs)} CSV(s) -> {out}")
+        if csvs:
+            latest = max(csvs, key=lambda p: p.stat().st_mtime)
+            print(f"\n=== {latest.name} ===\n{latest.read_text()}")
+        return
+
+    # media
+    import datetime
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = Path(args.out).expanduser() if getattr(args, "out", None) \
+        else Path.home() / f"Desktop/ipod_media_{stamp}"
+    orig = out / "originals"; orig.mkdir(parents=True, exist_ok=True)
+
+    globs = ["screenshot[0-9]*.bmp", "rec[0-9]*.rec"]
+    n = tr._mount_pull(globs)
+    if n < 0:
+        sys.exit("could not mount the iPod (disk mode?) — try replugging")
+    if n == 0:
+        print("nothing to pull (no screenshots/recordings on the iPod)")
+        for p in (orig, out):
+            try: p.rmdir()
+            except OSError: pass
+        return
+    tr._fetch(str(orig))
+
+    try:
+        from PIL import Image
+    except ImportError:
+        sys.exit("Pillow is required to convert media — run `start deps`")
+    nshot = nrec = 0
+    for b in sorted(orig.glob("*.bmp")):
+        (out / "screenshots").mkdir(exist_ok=True)
+        try:
+            Image.open(b).save(out / "screenshots" / (b.stem + ".png")); nshot += 1
+        except Exception:
+            pass
+    for r in sorted(orig.glob("*.rec")):
+        (out / "recordings").mkdir(exist_ok=True)
+        d = out / "recordings" / r.stem
+        if subprocess.run([sys.executable, str(ROOT / "tools" / "recsplit.py"), str(r), str(d)],
+                          capture_output=True).returncode == 0:
+            frames = len(list(d.glob("*.png")))
+            print(f"   {r.stem} -> {frames} frame(s)"); nrec += 1
+
+    # only wipe the device once the originals are safely on this machine
+    tr._clear_device(globs)
+    print(f"==> done: {nshot} screenshot(s), {nrec} recording(s) -> {out}  (iPod cleared)")
+
+    # encode the recordings to video. Default = GIF + H.264 MP4; --prores / --lossless
+    # add an Apple ProRes 4444 / a bit-exact qtrle .mov. ffmpeg is fetched on demand.
+    recdirs = [d for d in sorted((out / "recordings").glob("rec*"))
+               if d.is_dir() and next(d.glob("frame*.png"), None)] if nrec else []
+    if recdirs:
+        fmts = [f for f in ("gif", "mp4", "prores", "lossless") if getattr(args, f, False)]
+        if not fmts:
+            fmts = ["gif", "mp4"]
+        if _ensure_ffmpeg():
+            _encode_recordings(recdirs, out / "videos", fmts,
+                               fps=getattr(args, "fps", 30), force=getattr(args, "force", False))
+        else:
+            print("   (frames kept; re-run with ffmpeg installed to encode video)")
+
+    if platform.system() == "Darwin":
+        subprocess.run(["open", str(out)], check=False)
+
+
+# ----------------------------------------------------------- video encoding ---
+def _ensure_ffmpeg():
+    """ffmpeg is only needed to encode videos, so check for it lazily (here, the
+    first time an encode runs) rather than in the general setup. If it's missing,
+    offer to install it; if the user declines (or there's no way to), skip
+    encoding and return False."""
+    if _have("ffmpeg"):
+        return True
+    print("\nffmpeg is needed to encode videos, but it isn't installed.")
+    if platform.system() == "Darwin":
+        cmd, runner = "brew install ffmpeg", lambda: _run(["brew", "install", "ffmpeg"]).returncode == 0
+    else:
+        cmd = _linux_pkg_cmd("ffmpeg")
+        runner = (lambda: _linux_install("ffmpeg")) if cmd else None
+    if runner is None:
+        print("  no known way to auto-install ffmpeg here — install it manually, then re-run.")
+        return False
+    if not _confirm(f"  install it now?  ({cmd})"):
+        print("  skipping video encoding (ffmpeg not installed).")
+        return False
+    runner()
+    if not _have("ffmpeg"):
+        print("  ffmpeg still isn't on PATH — skipping video encoding.")
+        return False
+    return True
+
+
+def _frame_key(p):
+    """Numeric sort key so frame9999 < frame10000 (the recorder switches from 4- to
+    5-digit names past 9999, which would otherwise mis-order a plain glob)."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", p.name)]
+
+
+# codec recipes: ext + ffmpeg output args. 240x432 is even, so yuv420p is fine for H.264.
+_VID_FMTS = {
+    "gif":      ("gif",
+                 ["-filter_complex", "[0:v] split [a][b];[a] palettegen [p];[b][p] paletteuse"]),
+    "mp4":      ("mp4",
+                 ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+                  "-preset", "slow", "-movflags", "+faststart"]),
+    "prores":   ("prores.mov",
+                 ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuv444p10le", "-vendor", "apl0"]),
+    "lossless": ("lossless.mov",
+                 ["-c:v", "qtrle", "-pix_fmt", "rgb24"]),
+}
+
+
+def _encode_recordings(recdirs, outdir, fmts, fps=30, force=False):
+    """Encode each recNNNN frame folder in `recdirs` into the requested video
+    formats under `outdir`. Caller has already ensured ffmpeg is available."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    print(f"==> encoding {len(recdirs)} recording(s) -> {', '.join(fmts)} @ {fps}fps")
+    made = skipped = 0
+    for rd in recdirs:
+        frames = sorted(rd.glob("frame*.png"), key=_frame_key)
+        if not frames:
+            continue
+        # name <session>_<recNNNN> when the recordings/ layout is present, else recNNNN
+        session = rd.parent.parent.name if rd.parent.name == "recordings" else ""
+        stem = f"{session}_{rd.name}" if session else rd.name
+
+        todo = [f for f in fmts
+                if force or not (outdir / f"{stem}.{_VID_FMTS[f][0]}").exists()]
+        for f in fmts:
+            if f not in todo:
+                print(f"   skip   {stem}.{_VID_FMTS[f][0]}  (exists)"); skipped += 1
+        if not todo:
+            continue
+
+        # symlink the frames into a temp dir with uniform sequential numbering, so
+        # ffmpeg reads them in true numeric order regardless of 4-/5-digit padding
+        tmp = Path(tempfile.mkdtemp(prefix="nanovid_"))
+        try:
+            for i, fr in enumerate(frames):
+                os.symlink(fr.resolve(), tmp / f"{i:06d}.png")
+            for f in todo:
+                ext, codec = _VID_FMTS[f]
+                out = outdir / f"{stem}.{ext}"
+                print(f"   encode {out.name}  ({len(frames)} frames)")
+                rc = subprocess.run(
+                    ["ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-stats",
+                     "-framerate", str(fps), "-start_number", "0", "-i", str(tmp / "%06d.png")]
+                    + codec + ["-r", str(fps), str(out)]).returncode
+                made += 1 if rc == 0 else 0
+                if rc != 0:
+                    print(f"   ! ffmpeg failed on {out.name}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    print(f"==> {made} video(s) encoded, {skipped} skipped -> {outdir}")
+
+
+# ------------------------------------------------------------------ wizard ----
+def pick_target(apps=True, harnesses=True):
+    """List the requested target kinds and let the user choose by number or name.
+    apps/ are surface apps (installed to the home screen via the pack); harnesses/
+    are fixed-VA .bin probes that are SCSI-exec'd once."""
+    app_list, harn = [], []
+    if apps:
+        app_list = [d.name for d in sorted((ROOT / "apps").iterdir())
+                    if (d / "Makefile").is_file() and d.name not in NONAPPS]
+    if harnesses:
+        harn = [d.name for d in sorted((ROOT / "harnesses").iterdir())
+                if (d / "Makefile").is_file()]
+    names = app_list + harn
+    if app_list:
+        print("\n  apps:")
+        for i, a in enumerate(app_list, 1):
+            print(f"    {i:>2}. {a}")
+    if harn:
+        print("\n  harnesses (one-shot exec):" if not app_list else "  harnesses (one-shot exec):")
+        for i, h in enumerate(harn, len(app_list) + 1):
+            print(f"    {i:>2}. {h}")
+    raw = input("\n  number or name: ").strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(names):
+        return names[int(raw) - 1]
+    return raw
+
+
+def _new_ns():
+    """Prompt for the bits `start new` needs (name + surface kind)."""
+    name = input("\n  new app name (lowercase): ").strip()
+    print("  kind:  1) LVGL widgets   2) OpenGL   3) Paint-like (raw framebuffer)")
+    kind = {"1": "lvgl", "2": "gl", "3": "raw"}.get(input("  choose [1/2/3]: ").strip(), "lvgl")
+    return argparse.Namespace(name=name, kind=kind, frm=None, title=None)
+
+
+def wizard(args, tr):
+    ensure_build_deps()             # auto-check + install host deps at launch (silent if present)
+    def ins(**kw):
+        return argparse.Namespace(targets=kw.get("targets", []),
+                                  demo_data=kw.get("demo_data", False),
+                                  demo_data_force=kw.get("demo_data_force", False),
+                                  resident_only=kw.get("resident_only", False))
+    actions = [
+        ("Install all apps",         lambda: cmd_install(ins(), tr)),
+        ("Install all apps with demo data", lambda: cmd_install(ins(demo_data=True), tr)),
+        ("Install all apps + FORCE-recopy demo data (overwrite on-device edits)",
+                                     lambda: cmd_install(ins(demo_data=True, demo_data_force=True), tr)),
+        ("Install one app",          lambda: cmd_install(ins(targets=[pick_target(harnesses=False)]), tr)),
+        ("Install resident only (makes homebrew apps show up after restart)",
+                                     lambda: cmd_install(ins(resident_only=True), tr)),
+        ("Run a test harness once",  lambda: cmd_run(argparse.Namespace(target=pick_target(apps=False)), tr)),
+        ("Pull screenshots and screen recordings", lambda: cmd_pull(argparse.Namespace(what="media", out=None), tr)),
+        ("Pull benchmark CSVs",      lambda: cmd_pull(argparse.Namespace(what="bench", out=None), tr)),
+        ("Build all (does not install onto device)", lambda: cmd_build(argparse.Namespace(targets=[]))),
+        ("Create a new app",         lambda: cmd_new(_new_ns())),
+        ("Install dependencies",     lambda: cmd_bootstrap(argparse.Namespace(check=False), tr)),
+        ("Change iPod location (setup)", lambda: cmd_setup(argparse.Namespace())),
+        ("Repair iPod disk (fsck)",  lambda: cmd_fsck(argparse.Namespace(), tr)),
+        ("Peek DRAM",                lambda: cmd_peek(argparse.Namespace(addr=input("  addr (0x..): ").strip(), n="0x100"), tr)),
+        ("Dump trace",               lambda: cmd_trace(argparse.Namespace(n=48), tr)),
+        ("Eject iPod (return to Home Screen)", lambda: cmd_eject(argparse.Namespace(), tr)),
+        ("Remount iPod disk (Connected mode)", lambda: cmd_remount(argparse.Namespace(), tr)),
+    ]
+    print(f"start — transport: {tr.desc}\n")
+    for i, (label, _) in enumerate(actions, 1):
+        print(f"  {i}. {label}")
+    print("  q. quit")
+    choice = input("\nchoose: ").strip().lower()
+    if choice == "q" or not choice:
+        return
+    try:
+        actions[int(choice) - 1][1]()
+    except (ValueError, IndexError):
+        print("invalid choice")
+
+
+# -------------------------------------------------------------------- main ----
+def main():
+    p = argparse.ArgumentParser(prog="start", description="iPod build/deploy/probe driver")
+    p.add_argument("--remote", "--pi", dest="remote", default=None,
+                   help="SSH host (user@host) of the iPod's Linux computer; forces the SSH transport")
+    p.add_argument("--local", action="store_true",
+                   help="force local transport (the iPod is attached to THIS computer)")
+    sub = p.add_subparsers(dest="cmd")
+
+    # install (alias: deploy). --demo-data / --demo-data-force (aliases --data*).
+    for name in ("install", "deploy"):
+        sp = sub.add_parser(name)
+        sp.add_argument("targets", nargs="*")
+        sp.add_argument("--demo-data", "--data", dest="demo_data", action="store_true",
+                        help="also copy data/<Name>/ -> /Apps/Data, skipping folders already on device")
+        sp.add_argument("--demo-data-force", "--data-force", dest="demo_data_force", action="store_true",
+                        help="copy data/ -> /Apps/Data, OVERWRITING folders already on device")
+        sp.add_argument("--resident-only", action="store_true",
+                        help="skip the app compile; rebuild + re-exec just the resident (repack/install reuse built blobs)")
+    for name in ("deps", "bootstrap"):          # bootstrap == alias
+        sp = sub.add_parser(name)
+        sp.add_argument("--check", action="store_true", help="report missing deps but don't install")
+    sub.add_parser("setup")
+    sp = sub.add_parser("new")
+    sp.add_argument("name", help="new app folder/executable name (lowercase)")
+    sp.add_argument("--kind", choices=["lvgl", "gl", "raw"], default="lvgl",
+                    help="surface kind: lvgl widgets (default), gl (OpenGL), raw (Paint-like framebuffer)")
+    sp.add_argument("--from", dest="frm", metavar="APP",
+                    help="clone a specific existing app instead of the kind's default template")
+    sp.add_argument("--title", help="home-screen display name (default: from the name)")
+    sp = sub.add_parser("run");    sp.add_argument("target")
+    sp = sub.add_parser("build");  sp.add_argument("targets", nargs="*")
+    sp = sub.add_parser("peek");   sp.add_argument("addr"); sp.add_argument("n", nargs="?", default="0x200")
+    sp = sub.add_parser("trace");  sp.add_argument("n", nargs="?", type=int, default=48)
+    sub.add_parser("eject")
+    sub.add_parser("remount")
+    sub.add_parser("fsck")
+    sp = sub.add_parser("pull")
+    sp.add_argument("what", nargs="?", choices=["media", "bench"], default="media",
+                    help="media = screenshots + recordings (converted + encoded, then cleared); bench = benchmark CSVs")
+    sp.add_argument("--out", help="output dir (media default: ~/Desktop/ipod_media_<ts>)")
+    # recordings are encoded to video as part of a media pull: GIF + H.264 MP4 by
+    # default; these add/extend the set.
+    sp.add_argument("--prores",   action="store_true", help="also encode an Apple ProRes 4444 .mov")
+    sp.add_argument("--lossless", action="store_true",
+                    help="also encode a bit-exact QuickTime Animation (qtrle) .mov")
+    sp.add_argument("--gif",      action="store_true", help="encode a GIF (default unless other formats are chosen)")
+    sp.add_argument("--mp4",      action="store_true", help="encode an H.264 MP4 (default unless other formats are chosen)")
+    sp.add_argument("--fps", type=int, default=30, help="recording frame rate (default 30)")
+    sp.add_argument("--force", action="store_true", help="re-encode videos even if the output exists")
+    sub.add_parser("wizard")
+
+    args = p.parse_args()
+
+    # these don't touch the device, so don't make them prompt for the iPod's location
+    if args.cmd == "build":
+        cmd_build(args); return
+    if args.cmd == "setup":
+        cmd_setup(args); return
+    if args.cmd == "new":
+        cmd_new(args); return
+
+    # deps doesn't strictly need a configured device (host checks always run; the
+    # device-tools section uses the transport only if one's already set up).
+    tr = detect_transport(args, need_device=args.cmd not in ("deps", "bootstrap"))
+
+    if args.cmd in ("install", "deploy"):
+        cmd_install(args, tr)
+    elif args.cmd in ("deps", "bootstrap"):
+        cmd_bootstrap(args, tr)
+    elif args.cmd == "run":
+        cmd_run(args, tr)
+    elif args.cmd == "peek":
+        cmd_peek(args, tr)
+    elif args.cmd == "trace":
+        cmd_trace(args, tr)
+    elif args.cmd == "eject":
+        cmd_eject(args, tr)
+    elif args.cmd == "remount":
+        cmd_remount(args, tr)
+    elif args.cmd == "fsck":
+        cmd_fsck(args, tr)
+    elif args.cmd == "pull":
+        cmd_pull(args, tr)
+    else:                                   # no subcommand -> interactive wizard
+        wizard(args, tr)
+
+
+if __name__ == "__main__":
+    main()

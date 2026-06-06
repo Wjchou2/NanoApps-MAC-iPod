@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.level</string>
+	<key>CFBundleName</key>		<string>Level</string>
+	<key>CFBundleExecutable</key>	<string>level</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>ruler-horizontal</string>
+	<key>HBIconColor</key>		<string>#0da5f5</string>
+</dict>
+</plist>

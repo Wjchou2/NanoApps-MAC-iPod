@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.simonsays</string>
+	<key>CFBundleName</key>		<string>Simon Says</string>
+	<key>CFBundleExecutable</key>	<string>simonsays</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>clone</string>
+	<key>HBIconColor</key>		<string>#f2bc02</string>
+</dict>
+</plist>

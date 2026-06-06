@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.calculator</string>
+	<key>CFBundleName</key>		<string>Calculator</string>
+	<key>CFBundleExecutable</key>	<string>calculator</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>calculator</string>
+	<key>HBIconColor</key>		<string>#0da5f5</string>
+</dict>
+</plist>

@@ -1,0 +1,32 @@
+2026-05-30	11:00	Saturday brunch with Sam
+2026-06-02	10:00	Dentist appointment
+2026-06-02	14:30	Coffee with Alex
+2026-06-05	09:30	Project review with team
+2026-06-08	-	Mom's birthday
+2026-06-12	19:00	Movie night
+2026-06-15	-	Anniversary
+2026-06-15	19:30	Anniversary dinner
+2026-06-21	-	Father's Day
+2026-06-25	08:00	Flight to Lisbon
+2026-07-04	-	Independence Day
+2026-07-04	21:00	Fireworks at the park
+2026-07-11	-	Beach trip weekend
+2026-07-15	13:00	Lunch with Priya
+2026-07-20	-	Apollo 11 anniversary
+2026-08-03	09:00	Quarterly planning
+2026-08-14	20:00	Concert at the park
+2026-09-01	-	Labor Day BBQ
+2026-09-09	18:00	Yoga class
+2026-09-22	-	Autumn equinox
+2026-10-12	08:30	Hiking with Sam
+2026-10-31	-	Halloween
+2026-10-31	19:00	Halloween party
+2026-11-11	-	Veterans Day
+2026-11-26	-	Thanksgiving
+2026-11-26	17:00	Thanksgiving dinner
+2026-12-20	19:30	Holiday party
+2026-12-25	-	Christmas
+2026-12-31	22:00	NYE party
+2027-01-01	-	New Year
+2027-02-14	-	Valentine's Day
+2027-02-14	19:00	Valentine's dinner

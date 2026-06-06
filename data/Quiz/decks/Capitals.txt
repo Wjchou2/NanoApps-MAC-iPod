@@ -1,0 +1,55 @@
+Q: What is the capital of France?
+A: Paris
+A: London
+A: Berlin
+A: Madrid
+*: 1
+
+Q: What is the capital of Japan?
+A: Beijing
+A: Seoul
+A: Tokyo
+A: Bangkok
+*: 3
+
+Q: What is the capital of Australia?
+A: Sydney
+A: Canberra
+A: Melbourne
+A: Perth
+*: 2
+
+Q: What is the capital of Brazil?
+A: Rio de Janeiro
+A: Brasilia
+A: Sao Paulo
+A: Salvador
+*: 2
+
+Q: What is the capital of Canada?
+A: Toronto
+A: Vancouver
+A: Montreal
+A: Ottawa
+*: 4
+
+Q: What is the capital of Egypt?
+A: Cairo
+A: Alexandria
+A: Giza
+A: Luxor
+*: 1
+
+Q: What is the capital of South Korea?
+A: Pyongyang
+A: Busan
+A: Seoul
+A: Incheon
+*: 3
+
+Q: What is the capital of Argentina?
+A: Buenos Aires
+A: Cordoba
+A: Rosario
+A: La Plata
+*: 1

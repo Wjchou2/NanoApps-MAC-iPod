@@ -1,0 +1,10 @@
+Coffee Co. Loyalty	Gold Member	CFG-0098-7634	8d6e63
+Library Card	Public Library	LIB-44102-7	2a9d8f
+Gym Membership	Health Club	GYM-2026-001	e63946
+Airline Status	Frequent Flyer Silver	FF-12345-678	457b9d
+Grocery Rewards	Daily Saver	GR-987654321	2a9d8f
+Cinema Pass	Annual Pass	CIN-0042	c679d6
+Train Pass	Monthly Commuter	TR-MAR-2026	14213d
+Hotel Loyalty	Platinum Tier	HTL-77001-X	f77f00
+Pharmacy	Wellness Card	RX-44721-9	2a9d8f
+Bookstore	Reader Plus	BK-2026-7788	8d6e63

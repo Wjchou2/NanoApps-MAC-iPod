@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.reminders</string>
+	<key>CFBundleName</key>		<string>Reminders</string>
+	<key>CFBundleExecutable</key>	<string>reminders</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>list-check</string>
+	<key>HBIconColor</key>		<string>#69809d</string>
+</dict>
+</plist>

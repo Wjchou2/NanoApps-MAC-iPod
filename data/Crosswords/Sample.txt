@@ -1,0 +1,23 @@
+TITLE: Backyard
+SIZE: 7
+GRID:
+CAT#DOG
+A#O#R#O
+T##BEE#
+###U###
+#FLY#OW
+#O###W#
+#X##YES
+ACROSS:
+1 1 Feline pet
+1 5 Loyal friend
+3 4 Honey maker
+5 2 Buzzes by
+5 6 OW! (excl.)
+7 5 Affirmative
+DOWN:
+1 1 Feline pet
+1 4 Sneaky orange creature
+1 7 Hoot bird (sing.)
+5 2 Cunning canine
+6 6 Whoo's there
