@@ -9,9 +9,9 @@ static void changed(lv_event_t *e) {
     int value = lv_slider_get_value(slider);
     int brightness = value * 255 / 100;
     hb_brightness_set(brightness);
-    
+
     char text[16];
-    lv_label_set_text(label,"%d" text);
+    lv_label_set_text(label,"%d", text);
 
 
 }
