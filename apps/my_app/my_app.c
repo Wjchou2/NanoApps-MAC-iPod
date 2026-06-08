@@ -5,10 +5,13 @@
 static void changed(lv_event_t *e) {
     lv_obj_t *label = lv_event_get_user_data(e);
     lv_obj_t *slider = lv_event_get_target(e);
+    
     int value = lv_slider_get_value(slider);
-    hb_brightness_set(value);
+    int brightness = value * 255 / 100;
+    hb_brightness_set(brightness);
+    
     char text[16];
-    lv_label_set_text(label, text);
+    lv_label_set_text(label,"%d" text);
 
 
 }
