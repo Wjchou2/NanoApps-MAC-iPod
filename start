@@ -42,7 +42,8 @@ Commands (all also runnable interactively via `start` with no args -> wizard):
                               skip-existing; --demo-data-force overwrites on-device;
                               --resident-only re-execs just the resident, no app compile)
   start run <target>          build one target + run it once over SCSI
-  start pull [media|bench]    mount the iPod's FAT disk and pull files: `media`
+  start pull [media|bench]    mount the iPod's FAT or HFS+ disk and pull files:
+                             `media`
                              grabs screenshots + recordings, converts them
                              (Pillow + recsplit), encodes the recordings to video
                              (GIF + H.264 MP4 by default; --prores adds ProRes 4444,
@@ -52,8 +53,8 @@ Commands (all also runnable interactively via `start` with no args -> wizard):
                              `bench` grabs the benchmark CSVs into bench_results/
   start eject                 leave Connected mode so the iPod mounts its FS / home
   start remount               put the iPod in Connected mode + mount its disk read-write
-  start fsck                  repair the iPod's FAT filesystem (fixes a read-only
-                             disk left by a panic / unclean eject)
+  start fsck                  repair the iPod's FAT or HFS+ filesystem (fixes a
+                             read-only disk left by a panic / unclean eject)
   start peek <addr> [n]       dump n bytes of iPod DRAM (default 0x200) as hex
   start trace [n]             print the last n resident trace entries
   start build [targets...]    build only (no device)
@@ -281,12 +282,19 @@ def setup_lvgl(check_only=False):
 # Pillow + the Rust toolchain (cargo), plus the LVGL + Font Awesome checkouts.
 RUST_PKGS = {"apt-get": "cargo", "dnf": "cargo", "pacman": "rust", "zypper": "cargo"}
 
-# Tools the iPod's Linux computer needs (SCSI transport + FAT mount/repair). Package
-# names vary by distro, so each maps to a {manager: package} dict (or a plain str).
+# Tools the iPod's Linux computer always needs. Filesystem repair tools are selected
+# after the data partition has been detected, so HFS+ users are not forced to install
+# FAT utilities (and vice versa). Package names vary by distro, so each maps to a
+# {manager: package} dict (or a plain str).
 _SG3 = {"apt-get": "sg3-utils", "dnf": "sg3_utils", "pacman": "sg3_utils", "zypper": "sg3_utils"}
 _DOSFS = {"apt-get": "dosfstools", "dnf": "dosfstools", "pacman": "dosfstools", "zypper": "dosfstools"}
+_HFSPROGS = {"apt-get": "hfsprogs", "dnf": "hfsplus-tools", "pacman": "hfsprogs", "zypper": "hfsplus-tools"}
 DEVTOOLS = (("sg_raw", _SG3), ("sg_start", _SG3), ("rsync", "rsync"),
-            ("eject", "util-linux"), ("fsck.vfat", _DOSFS), ("mount", "util-linux"))
+            ("eject", "util-linux"), ("lsblk", "util-linux"), ("mount", "util-linux"))
+FSCK_TOOLS = {
+    "vfat": (("fsck.vfat", _DOSFS),),
+    "hfsplus": (("fsck.hfsplus", _HFSPROGS),),
+}
 
 
 def ensure_build_deps():
@@ -369,13 +377,13 @@ def ensure_build_deps():
         runner()
 
 
-def ensure_device_deps(tr):
-    """Best-effort auto-install of the iPod-machine's SCSI/FAT tools before a deploy
+def ensure_device_deps(tr, tools=DEVTOOLS):
+    """Best-effort auto-install of tools on the iPod's Linux computer before a deploy
     needs them. One batched, sbin-aware presence probe (non-login SSH PATH omits
     /sbin), so it's a single round-trip and silent + fast when all present. Skips
     quietly if the iPod's computer isn't reachable."""
     probe = "; ".join(f'PATH=/usr/sbin:/sbin:$PATH command -v {t} >/dev/null 2>&1 || echo {t}'
-                      for t, _ in DEVTOOLS)
+                      for t, _ in tools)
     if tr.mode == "ssh":
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", tr.pi, probe],
                            capture_output=True, text=True)
@@ -392,7 +400,7 @@ def ensure_device_deps(tr):
     if not _confirm(f"Install them on {where} now?"):
         print("skipped — install them, then re-run.")
         return
-    for tool, pkgs in DEVTOOLS:
+    for tool, pkgs in tools:
         if tool in missing:
             _remote_install(tr, pkgs) if tr.mode == "ssh" else _linux_install(pkgs)
 
@@ -406,6 +414,7 @@ class Transport:
         self.mode = mode            # "local" | "ssh"
         self.pi = pi                # user@host when mode == "ssh", else None
         self._dev = os.environ.get("IPOD_DEV")
+        self._data_volume = None
 
     @property
     def desc(self):
@@ -425,6 +434,79 @@ class Transport:
                           capture=True).strip()
             self._dev = out or "/dev/sda"
         return self._dev
+
+    def data_volume(self):
+        """Return ``(partition, fstype)`` for the iPod's media/data volume.
+
+        Windows-formatted iPods normally expose a VFAT partition at partition 1;
+        Mac-formatted iPods normally expose HFS+ at partition 2. Prefer a verified
+        HFS+ volume header on partition 2, even when lsblk has not populated its
+        filesystem metadata yet; otherwise choose the largest supported partition.
+        IPOD_PART and IPOD_FS remain available for unusual or damaged layouts.
+        """
+        if self._data_volume:
+            return self._data_volume
+
+        dev = self.dev()
+        requested_part = os.environ.get("IPOD_PART", "").strip()
+        requested_fs = os.environ.get("IPOD_FS", "").strip().lower()
+        aliases = {"fat": "vfat", "fat32": "vfat", "msdos": "vfat",
+                   "hfs+": "hfsplus", "hfs_plus": "hfsplus"}
+        requested_fs = aliases.get(requested_fs, requested_fs)
+        if requested_fs and requested_fs not in ("vfat", "hfsplus"):
+            sys.exit(f"unsupported IPOD_FS={requested_fs!r}; use vfat or hfsplus")
+
+        # Starting/ejecting the disk can recreate the partition nodes. A Mac iPod's
+        # data volume is conventionally partition 2, but derive it from the detected
+        # base disk rather than hard-coding /dev/sda2 (the kernel may call it sdb2 on
+        # the next connection). Checking the HFS+/HFSX header at byte 1024 avoids a
+        # race where the node exists before lsblk/udev knows its filesystem type.
+        target = requested_part or dev
+        probe = f"""sudo sg_start {dev} --loej 2>/dev/null || true
+case {dev} in *[0-9]) hfs_part={dev}p2;; *) hfs_part={dev}2;; esac
+for i in $(seq 1 40); do
+  if [ -z "{requested_part}" ] && [ -b "$hfs_part" ]; then
+    sig=$(sudo dd if="$hfs_part" bs=1 skip=1024 count=2 status=none 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [ "$sig" = 482b ] || [ "$sig" = 4858 ]; then
+      size=$(lsblk -bnro SIZE "$hfs_part" 2>/dev/null | head -1)
+      echo "$hfs_part hfsplus ${{size:-0}}"; break
+    fi
+  fi
+  rows=$(lsblk -bnpo NAME,FSTYPE,TYPE,SIZE {target} 2>/dev/null | awk '$3 == "part" && (tolower($2) == "vfat" || tolower($2) == "hfsplus") {{print $1, $2, $4}}')
+  if [ -n "$rows" ]; then echo "$rows"; break; fi
+  sleep 1
+done"""
+        rows = self.sh(probe, capture=True).splitlines()
+        candidates = []
+        for row in rows:
+            fields = row.split()
+            if len(fields) != 3:
+                continue
+            part, raw_fs, size = fields
+            fstype = aliases.get(raw_fs.lower(), raw_fs.lower())
+            if requested_fs:
+                fstype = requested_fs
+            if fstype not in ("vfat", "hfsplus"):
+                continue
+            if requested_part and part != requested_part:
+                continue
+            try:
+                size_bytes = int(size)
+            except ValueError:
+                size_bytes = 0
+            candidates.append((size_bytes, part, fstype))
+
+        # With both overrides, damaged on-disk metadata need not be readable.
+        if not candidates and requested_part and requested_fs:
+            candidates.append((0, requested_part, requested_fs))
+        if not candidates:
+            override = " Set IPOD_PART=/dev/... and IPOD_FS=hfsplus to override detection."
+            sys.exit("could not find a VFAT or HFS+ data partition on the iPod." + override)
+
+        _, part, fstype = max(candidates)
+        self._data_volume = (part, fstype)
+        print(f"    iPod data volume: {part} ({'HFS+' if fstype == 'hfsplus' else 'FAT'})")
+        return self._data_volume
 
     def peek(self, addr, n=0x200):
         """Return n bytes of iPod DRAM via the custom SCSI peek (c6 96 02).
@@ -453,25 +535,24 @@ class Transport:
             out += chunk
         return bytes(out)
 
-    # ---- disk-mode media/file pulls (mount the FAT partition, not SCSI peek) ----
+    # ---- disk-mode media/file pulls (mount the data partition, not SCSI peek) ----
     # All three run ON the device host (local or over SSH) through one bash snippet,
     # so the same code path works whether the iPod is attached to this computer or a remote one.
     PULL_TMP = "/tmp/nano_pull"
 
     def _mount_pull(self, globs):
-        """Switch the iPod to disk mode, mount its FAT partition read-only, copy
+        """Switch the iPod to disk mode, mount its data partition read-only, copy
         every file matching `globs` (shell globs relative to the mount root) into
         PULL_TMP on the device host, unmount. Returns the file count, or -1 if the
         mount failed."""
-        dev = self.dev(); part = dev + "1"
+        dev = self.dev(); part, fstype = self.data_volume()
         cps = "; ".join(f'cp {g} "$T"/ 2>/dev/null || true' for g in globs)
         script = (
             f'set -u; dev={dev}; part={part}; mnt=/mnt/nanoapps-ipod; T={self.PULL_TMP}; '
             f'sudo sg_start "$dev" --loej 2>/dev/null || true; '
             f'for i in $(seq 1 30); do test -e "$part" && break; sleep 1; done; '
-            f'sudo fsck.vfat -a "$part" >/dev/null 2>&1 || true; '
             f'sudo mkdir -p "$mnt"; sudo umount "$part" 2>/dev/null || true; '
-            f'ok=; for i in $(seq 1 20); do sudo mount -o ro,flush "$part" "$mnt" 2>/dev/null && {{ ok=1; break; }}; sleep 1; done; '
+            f'ok=; for i in $(seq 1 20); do sudo mount -t {fstype} -o ro "$part" "$mnt" 2>/dev/null && {{ ok=1; break; }}; sleep 1; done; '
             f'[ -n "$ok" ] || {{ echo MOUNT_FAILED; exit 1; }}; '
             f'rm -rf "$T"; mkdir -p "$T"; cd "$mnt"; {cps}; '
             f'chmod 644 "$T"/* 2>/dev/null || true; sudo umount "$mnt" 2>/dev/null || true; '
@@ -497,12 +578,13 @@ class Transport:
     def _clear_device(self, globs):
         """Remount rw and delete files matching `globs`, then eject. Only call once
         the originals are safely copied to the host."""
-        dev = self.dev(); part = dev + "1"
+        dev = self.dev(); part, fstype = self.data_volume()
+        if fstype == "vfat":
+            ensure_device_deps(self, FSCK_TOOLS[fstype])
         rms = "; ".join(f'sudo rm -f {g} 2>/dev/null || true' for g in globs)
         script = (
+            _mount_prep(dev, part, fstype, "/mnt/nanoapps-ipod") +
             f'set -u; dev={dev}; part={part}; mnt=/mnt/nanoapps-ipod; '
-            f'sudo umount "$part" 2>/dev/null || true; '
-            f'sudo mount -o rw,flush "$part" "$mnt" 2>/dev/null || {{ echo RW_FAILED; exit 1; }}; '
             f'cd "$mnt"; {rms}; sync; sudo umount "$mnt" 2>/dev/null || true; '
             f'sudo eject "$dev" 2>/dev/null || sudo sg_start "$dev" --loej 2>/dev/null || true; '
             f'echo CLEARED')
@@ -793,9 +875,13 @@ def _push_run(tr, name):
     print(f"==> {name}.bin = {binp.stat().st_size} bytes, LINK_VA = {hex(link_va)}, dev = {tr.dev()}")
     if not tr.wait_connected():
         sys.exit(f"{tr.dev()} never appeared — put the iPod in Connected mode")
-    # unmount + eject so the FS is quiescent, then upload + exec, then eject again
+    # Unmount every partition (Mac/HFS+ layouts use a different partition number
+    # than Windows/FAT layouts) so the FS is quiescent, then upload + exec.
     # (the SCSI exec re-enters Connected mode; the post-eject lands us on home).
-    tr.sh(f"sudo umount {tr.dev()}1 2>/dev/null; sudo umount {tr.dev()} 2>/dev/null; true", check=False)
+    dev = tr.dev()
+    tr.sh(f"lsblk -lnpo NAME,TYPE {dev} 2>/dev/null | "
+          "awk '$2 == \"part\" {print $1}' | xargs -r -n1 sudo umount 2>/dev/null; true",
+          check=False)
     tr.eject()
     time.sleep(3)
     tr.scsi_write_file(str(binp), link_va)
@@ -804,42 +890,54 @@ def _push_run(tr, name):
 
 
 # ---- disk install ------------------------------------------------------------
-def _fat_mount_prep(dev, part, mnt):
-    """Bash that puts the iPod in Connected mode and mounts its FAT partition
-    READ-WRITE at `mnt`. A panic or unclean eject leaves the FAT 'dirty', and
-    Linux then mounts it read-only EVEN with -o rw — so we clear the dirty bit with
-    fsck BEFORE mounting, then verify the mount is actually writable (touch test)
-    and remount via fsck if it came up read-only."""
+def _mount_prep(dev, part, fstype, mnt):
+    """Return Bash that mounts a detected FAT or HFS+ data volume read-write.
+
+    FAT's dirty bit commonly causes a silent read-only mount, so it is repaired
+    before and between attempts. HFS+ must not be passed through a FAT checker;
+    Linux's hfsplus driver performs a normal writable mount and the touch test
+    catches journaled/locked volumes that it correctly refuses to modify.
+    """
+    if fstype not in ("vfat", "hfsplus"):
+        raise ValueError(f"unsupported filesystem: {fstype}")
+    mount_options = "rw,flush" if fstype == "vfat" else "rw"
+    repair = (f"sudo fsck.vfat -a -w {part} >/dev/null 2>&1 || true"
+              if fstype == "vfat" else ":")
+    label = "FAT" if fstype == "vfat" else "HFS+"
+    hint = ("run: ./start fsck" if fstype == "vfat" else
+            "HFS+ may be journaled or locked; disable journaling on the Mac, then run: ./start fsck")
     return f"""set -e
 sudo sg_start {dev} --loej 2>/dev/null || true
 for i in $(seq 1 40); do test -e {part} && break; sleep 1; done
 test -e {part} || {{ echo 'device never appeared in Connected mode' >&2; exit 1; }}
 udisksctl unmount -b {part} 2>/dev/null || sudo umount {part} 2>/dev/null || true
-sudo fsck.vfat -a -w {part} >/dev/null 2>&1 || true   # clear the dirty bit up front
+{repair}
 sudo mkdir -p {mnt}
 mounted=
 for i in $(seq 1 6); do
   sudo umount {mnt} 2>/dev/null || true
-if sudo mount -t hfsplus -o rw {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
+  if sudo mount -t {fstype} -o {mount_options} {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
     sudo rm -f {mnt}/.hbrw; mounted=1; break
   fi
   sudo umount {mnt} 2>/dev/null || true
-  # sudo fsck.vfat -a -w {part} >/dev/null 2>&1 || true
+  {repair}
   sleep 1
 done
-[ -n "$mounted" ] || {{ echo 'could not mount the iPod read-write (FAT may be corrupt) - run: ./start fsck' >&2; exit 1; }}
+[ -n "$mounted" ] || {{ echo 'could not mount the iPod {label} volume read-write ({hint})' >&2; exit 1; }}
 """
 
 
 def _install_disk(tr, src, data, data_force):
-    """Mount the iPod's FAT partition and write the staged /Apps tree. Preserves
+    """Mount the iPod's data partition and write the staged /Apps tree. Preserves
     /Apps/Data; sweeps retired layouts. Never DRAM-stages (that white-screens the
     live OS)."""
     stage = "/tmp/hbapps"
     tr.stage(f"{src}/Apps", f"{stage}/Apps")
     if (data or data_force) and (ROOT / "data").is_dir():
         tr.stage(str(ROOT / "data"), f"{stage}/data")
-    dev = tr.dev(); part = dev + "2"
+    dev = tr.dev(); part, fstype = tr.data_volume()
+    if fstype == "vfat":
+        ensure_device_deps(tr, FSCK_TOOLS[fstype])
     mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
     force = "1" if data_force else ""
     copy = f"""# Replace the app payload but PRESERVE {mnt}/Apps/Data, and sweep retired layouts
@@ -868,7 +966,7 @@ echo "/Apps/Executables: $(ls {mnt}/Apps/Executables | wc -l | tr -d ' ')"
 [ -d {mnt}/Apps/Data ] && echo "/Apps/Data folders: $(ls {mnt}/Apps/Data | wc -l | tr -d ' ')"
 sudo umount {mnt}
 echo 'apps installed to disk'"""
-    tr.sh(_fat_mount_prep(dev, part, mnt) + copy)
+    tr.sh(_mount_prep(dev, part, fstype, mnt) + copy)
 
 
 # ---- full app deploy ---------------------------------------------------------
@@ -918,7 +1016,7 @@ def cmd_install(args, tr):
     targets (or none) go through the pack pipeline; harness/system targets are
     built + SCSI-exec'd once — so `start install <harness>` deploys a harness too."""
     ensure_build_deps()
-    ensure_device_deps(tr)          # auto-install the iPod-machine's SCSI/FAT tools
+    ensure_device_deps(tr)          # common SCSI, mount, and partition tools
     targets = list(getattr(args, "targets", []) or [])
     app_targets, oneshot = [], []
     for t in targets:
@@ -1006,9 +1104,8 @@ def cmd_bootstrap(args, tr):
     if not setup_fontawesome(check_only=check_only):
         missing.append("fontawesome/")
 
-    # The iPod's machine needs the SCSI transport tools + FAT mount/repair (the disk
-    # install mounts the iPod's FAT partition and fsck.vfat's it when a panic left it
-    # dirty) — see module-level DEVTOOLS.
+    # The iPod's machine needs common SCSI/mount tools. The FAT or HFS+ repair
+    # utility is selected on demand after the data filesystem is detected.
     devtools = DEVTOOLS
 
     print("\n[device] SCSI transport deps on the iPod's machine")
@@ -1022,7 +1119,7 @@ def cmd_bootstrap(args, tr):
         else:
             for tool, pkgs in devtools:
                 # include the sbin dirs: a non-login ssh PATH usually omits them, so
-                # fsck.vfat / mount (in /sbin) would look "missing" though installed.
+                # Utilities in /sbin would look "missing" though installed.
                 ok = tr.sh(f"PATH=/usr/sbin:/sbin:$PATH command -v {tool} >/dev/null 2>&1 && echo y",
                            capture=True).strip() == "y"
                 print(f"  remote:{tool:<15} {'ok' if ok else 'MISSING'}")
@@ -1065,26 +1162,24 @@ def cmd_eject(args, tr):
 
 
 def cmd_fsck(args, tr):
-    """Repair the iPod's FAT filesystem. A panic or unclean eject can leave the
-    FAT marked 'dirty', which makes Linux mount it READ-ONLY (installs then fail
-    with 'Read-only file system'). This clears that and verifies a read-write
-    mount."""
-    dev = tr.dev(); part = dev + "1"
+    """Repair the detected FAT or HFS+ data filesystem, then verify an RW mount."""
+    dev = tr.dev(); part, fstype = tr.data_volume()
+    ensure_device_deps(tr, FSCK_TOOLS[fstype])
     mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
-    print(f"==> repairing {part} on the iPod's computer")
+    label = "HFS+" if fstype == "hfsplus" else "FAT"
+    checker = (f"sudo fsck.vfat -a -w -v {part}"
+               if fstype == "vfat" else f"sudo fsck.hfsplus -f -y {part}")
+    print(f"==> repairing {part} ({label}) on the iPod's computer")
     script = f"""sudo sg_start {dev} --loej 2>/dev/null || true
 for i in $(seq 1 40); do test -e {part} && break; sleep 1; done
 test -e {part} || {{ echo 'device never appeared in Connected mode' >&2; exit 1; }}
 udisksctl unmount -b {part} 2>/dev/null || sudo umount {part} 2>/dev/null || true
-sudo fsck.vfat -a -w -v {part} 2>&1 | tail -20 || sudo fsck.vfat -a -w {part} || true
+command -v {'fsck.hfsplus' if fstype == 'hfsplus' else 'fsck.vfat'} >/dev/null 2>&1 || {{ echo 'filesystem repair tool is missing' >&2; exit 1; }}
+{checker} 2>&1 | tail -20 || true
 echo '--- verifying read-write mount ---'
-sudo mkdir -p {mnt}
-if sudo mount -t hfsplus -o rw {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
-  sudo rm -f {mnt}/.hbrw; sudo umount {mnt}; echo 'OK: the iPod filesystem is healthy and writable'
-else
-  sudo umount {mnt} 2>/dev/null || true
-  echo 'STILL not writable — the FAT may need a deeper repair (back up + reformat the data partition from a PC)'; exit 1
-fi"""
+""" + _mount_prep(dev, part, fstype, mnt) + f"""sudo umount {mnt}
+echo 'OK: the iPod {label} filesystem is healthy and writable'
+"""
     rc = tr.sh(script, check=False).returncode
     tr.eject()              # back to the home screen
     if rc != 0:
@@ -1092,12 +1187,14 @@ fi"""
 
 
 def cmd_remount(args, tr):
-    """Put the iPod into Connected (mass-storage) mode and mount its FAT partition
+    """Put the iPod into Connected mode and mount its detected data partition
     read-write on the iPod's computer (the inverse of eject)."""
-    dev = tr.dev(); part = dev + "1"
+    dev = tr.dev(); part, fstype = tr.data_volume()
+    if fstype == "vfat":
+        ensure_device_deps(tr, FSCK_TOOLS[fstype])
     mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
-    print(f"==> mounting {part} read-write at {mnt}")
-    tr.sh(_fat_mount_prep(dev, part, mnt) + f"echo 'mounted read-write at {mnt}'")
+    print(f"==> mounting {part} ({'HFS+' if fstype == 'hfsplus' else 'FAT'}) read-write at {mnt}")
+    tr.sh(_mount_prep(dev, part, fstype, mnt) + f"echo 'mounted read-write at {mnt}'")
 
 
 def cmd_setup(args):
@@ -1138,7 +1235,7 @@ def cmd_trace(args, tr):
 
 
 def cmd_pull(args, tr):
-    """Pull files off the iPod's FAT disk (over whichever transport). `media` grabs
+    """Pull files off the iPod's data disk (over whichever transport). `media` grabs
     screenshots + recordings, converts them, and clears them from the device;
     `bench` grabs the benchmark CSVs into bench_results/. Conversion is done here
     with Pillow + recsplit.py so it works on Linux and macOS alike."""

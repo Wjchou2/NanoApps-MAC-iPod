@@ -15,7 +15,7 @@ You need:
 - [iPod nano 7th generation](https://www.backmarket.com/en-us/search?q=iPod+nano+7)
 - A [Linux computer](https://www.debian.org) (such as a [Raspberry Pi](https://www.raspberrypi.com)) to connect the iPod to
 
-NanoApps depends on ipod_sun_untethered. On a Windows PC, visit the [ipod_sun_untethered releases page](https://github.com/nfzerox/ipod_sun_untethered/releases), download the IPSW for your iPod nano 7 model, and restore it with [iTunes](https://www.apple.com/itunes/). Mac-formatted iPods can work, but writing to an HFS formatted iPod from Linux/Raspberry Pi is experimental.
+NanoApps depends on ipod_sun_untethered. On a Windows PC, visit the [ipod_sun_untethered releases page](https://github.com/nfzerox/ipod_sun_untethered/releases), download the IPSW for your iPod nano 7 model, and restore it with [iTunes](https://www.apple.com/itunes/). Both Windows-formatted FAT iPods and Mac-formatted HFS+ iPods are detected automatically. Linux cannot safely write a journaled HFS+ volume, so disable journaling on the iPod's data volume from a Mac before installing NanoApps.
 
 The SCSI command channel installed by ipod_sun_untethered can cause the iPod to repeatedly reboot when connected to iTunes, Apple Devices, or Finder. After restoring, disconnect the iPod from your Windows PC or Mac, and connect it to your Raspberry Pi or a Linux machine. 
 
@@ -122,7 +122,7 @@ NanoApps gives you a small C SDK ([`sdk/hb_sdk.h`](sdk/hb_sdk.h)) covering [disp
 
 `./start` is the single entry point for everything: building, installing, scaffolding new apps, pulling screenshots, and repairing the disk. It auto-detects whether the iPod is attached to this computer or to a remote Linux computer over SSH, and runs every device operation through the right transport, so the same command works either way. It finds the iPod's disk automatically by its SCSI model, so you never need to know the device node or give the volume a particular name.
 
-On first use it asks where the iPod is attached and remembers the answer (re-run `./start setup` to change it), then installs anything missing, including the ARM toolchain, Python with Pillow, the Rust toolchain, the pinned LVGL checkout, Font Awesome, and the SCSI and FAT tools on the iPod's computer.
+On first use it asks where the iPod is attached and remembers the answer (re-run `./start setup` to change it), then installs anything missing, including the ARM toolchain, Python with Pillow, the Rust toolchain, the pinned LVGL checkout, Font Awesome, and the SCSI and disk tools on the iPod's computer. Device operations detect whether the data volume is FAT or HFS+ and select the matching mount and repair commands.
 
 Build everything without touching the device with `./start build`, and run `./start` with no arguments for the interactive menu.
 
@@ -201,7 +201,7 @@ Unmounted /dev/sda1
 cp: cannot create regular file '/mnt/nanoapps-ipod/Apps/Executables/Notes.hbapp': Input/output error
 ```
 
-the iPod's FAT filesystem is corrupted (usually from an unclean disconnect). Repair it, then install again:
+the iPod's FAT or HFS+ filesystem may be corrupted (usually from an unclean disconnect). Repair the detected data volume, then install again:
 
 ```sh
 ./start fsck
